@@ -1,0 +1,195 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: benefits_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-benefits}
+      POSTGRES_USER: ${POSTGRES_USER:-benefits_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits_pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-benefits_user}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: benefits_redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: benefits_ollama
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: benefits_migrate
+    command: migrate
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-benefits}
+      POSTGRES_USER: ${POSTGRES_USER:-benefits_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits_pass}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - benefits_network
+
+  seeds:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: benefits_seeds
+    command: seed
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-benefits}
+      POSTGRES_USER: ${POSTGRES_USER:-benefits_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits_pass}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+      DEMO_PASSWORD: ${DEMO_PASSWORD:-Demo1234!}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - benefits_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: benefits_backend
+    command: serve
+    environment:
+      PROJECT_NAME: "Corporate Benefits Platform"
+      DEBUG: ${DEBUG:-false}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-benefits}
+      POSTGRES_USER: ${POSTGRES_USER:-benefits_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits_pass}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_ALGORITHM: HS256
+      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 15
+      JWT_REFRESH_TOKEN_EXPIRE_DAYS: 7
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://localhost:3000}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
+      AI_ENABLED: ${AI_ENABLED:-true}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-30}
+      CLICK_SERVICE_ID: ${CLICK_SERVICE_ID}
+      CLICK_MERCHANT_ID: ${CLICK_MERCHANT_ID}
+      CLICK_SECRET_KEY: ${CLICK_SECRET_KEY}
+      CLICK_MERCHANT_USER_ID: ${CLICK_MERCHANT_USER_ID}
+      CLICK_SANDBOX: ${CLICK_SANDBOX:-true}
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+    ports:
+      - "8000:8000"
+    depends_on:
+      seeds:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: benefits_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:80/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: benefits_nginx
+    ports:
+      - "${NGINX_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
+volumes:
+  pgdata:
+    name: benefits_pgdata
+  redisdata:
+    name: benefits_redisdata
+  ollama:
+    name: benefits_ollama
+
+networks:
+  benefits_network:
+    name: benefits_network
+    driver: bridge
