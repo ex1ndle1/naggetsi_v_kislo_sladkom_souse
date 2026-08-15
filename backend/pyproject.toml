@@ -9,14 +9,17 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36",
     "alembic>=1.14.0",
     "asyncpg>=0.30.0",
-    "pydantic>=2.10.0",
+    # [email] — из-за EmailStr в схемах регистрации и приглашений: без него
+    # pydantic падает при построении модели, а не при валидации значения.
+    "pydantic[email]>=2.10.0",
     "pydantic-settings>=2.6.0",
     "redis>=5.2.0",
-    "python-jose[cryptography]>=3.3.0",
-    "passlib[argon2]>=1.7.4",
+    "pyjwt>=2.10.0",
+    "argon2-cffi>=23.1.0",
     "python-multipart>=0.0.12",
     "httpx>=0.27.0",
     "sse-starlette>=2.2.0",
+    "structlog>=24.4.0",
 ]
 
 [project.optional-dependencies]
@@ -27,6 +30,7 @@ dev = [
     "httpx>=0.27.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
+    "pytest-mock>=3.14.0",
 ]
 
 [build-system]
@@ -35,11 +39,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
-addopts = "-v --cov=app --cov-report=term-missing --cov-report=html"
+# Покрытие включается явным флагом в CI, чтобы точечные прогоны не тормозили.
+addopts = "-v"
 
 [tool.ruff]
 line-length = 120
@@ -48,6 +55,12 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "UP"]
 ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Иерархия ошибок домена названа по HTTP-семантике (NotFound, Conflict, Forbidden),
+# а не по суффиксу Error: имена входят в публичный контракт и используются во всех
+# роутерах. Переименование ради N818 ломает импорты без выигрыша.
+"app/core/errors.py" = ["N818"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -58,5 +71,5 @@ disallow_untyped_defs = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["redis.*", "passlib.*", "jose.*"]
+module = ["redis.*", "argon2.*", "sse_starlette.*"]
 ignore_missing_imports = true

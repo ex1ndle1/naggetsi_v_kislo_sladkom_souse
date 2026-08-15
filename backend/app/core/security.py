@@ -5,7 +5,7 @@ JWT: access 15 мин / refresh 7 дней, refresh с ротацией и jti-d
 RBAC: матрица роль→эндпоинты, покрывается параметризованным тестом.
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -14,7 +14,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import Argon2Error
 
 from app.core.config import settings
-from app.core.enums import UserRole
+from app.core.enums import UserPlan, UserRole
 
 __all__ = [
     "hash_password",
@@ -63,9 +63,16 @@ def create_access_token(
     role: UserRole,
     company_id: UUID | None = None,
     merchant_id: UUID | None = None,
+    plan: UserPlan | None = None,
 ) -> str:
-    """Создаёт access-токен (15 минут)."""
-    now = datetime.now(timezone.utc)
+    """Создаёт access-токен (15 минут).
+
+    plan попадает в claims, потому что от него зависит видимость каталога (§8), и
+    брать его из запроса нельзя. Токен короткий, поэтому смена тарифа отражается
+    в правах в пределах 15 минут — сам расчёт скидки при выдаче кода всё равно
+    сверяется с БД.
+    """
+    now = datetime.now(UTC)
     exp = now + timedelta(minutes=settings.jwt_access_expire_minutes)
 
     payload: dict[str, Any] = {
@@ -80,6 +87,8 @@ def create_access_token(
         payload["company_id"] = str(company_id)
     if merchant_id:
         payload["merchant_id"] = str(merchant_id)
+    if plan:
+        payload["plan"] = plan.value
 
     return jwt.encode(
         payload,
@@ -93,7 +102,7 @@ def create_refresh_token(*, user_id: UUID) -> tuple[str, str]:
 
     Возвращает (token, jti) — jti нужно сохранить в Redis для отзыва.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     exp = now + timedelta(days=settings.jwt_refresh_expire_days)
     jti = str(uuid4())
 
@@ -133,61 +142,83 @@ def decode_token(token: str) -> dict[str, Any]:
 # Формат: {"METHOD /path/pattern": [allowed_roles]}
 # Новый эндпоинт без политики → тест упадёт.
 
-RBAC_MATRIX: dict[str, list[UserRole]] = {
-    # Health & docs
-    "GET /api/v1/health": [UserRole.EMPLOYEE, UserRole.MERCHANT, UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
+_ALL_ROLES = [
+    UserRole.EMPLOYEE,
+    UserRole.MERCHANT,
+    UserRole.COMPANY_ADMIN,
+    UserRole.PLATFORM_ADMIN,
+]
 
-    # Auth (public)
-    "POST /api/v1/auth/register": [],  # публичный
+RBAC_MATRIX: dict[str, list[UserRole]] = {
+    # --- Служебное ---
+    "GET /api/v1/health": _ALL_ROLES,
+    # --- Аутентификация ---
+    # Пустой список = публичный эндпоинт. Регистрация публична по URL, но требует
+    # валидный invite token в теле: доступ контролируется токеном, не ролью.
+    "POST /api/v1/auth/register": [],
     "POST /api/v1/auth/login": [],
     "POST /api/v1/auth/refresh": [],
-    "POST /api/v1/auth/logout": [UserRole.EMPLOYEE, UserRole.MERCHANT, UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
-
-    # Benefits
-    "GET /api/v1/benefits": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN],
-    "GET /api/v1/benefits/{id}": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN, UserRole.MERCHANT],
-    "POST /api/v1/benefits": [UserRole.MERCHANT],
-    "PATCH /api/v1/benefits/{id}": [UserRole.MERCHANT],
-    "DELETE /api/v1/benefits/{id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
-
-    # Applications
-    "GET /api/v1/applications": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN],
-    "GET /api/v1/applications/{id}": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN],
-    "POST /api/v1/applications": [UserRole.EMPLOYEE],
-    "DELETE /api/v1/applications/{id}": [UserRole.EMPLOYEE],
-    "GET /api/v1/applications/events": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN],  # SSE
-
-    # Payments
-    "GET /api/v1/payments": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
-    "GET /api/v1/payments/{id}": [UserRole.EMPLOYEE, UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
-    "POST /api/v1/payments": [UserRole.EMPLOYEE],
-    "POST /api/v1/payments/click/prepare": [],  # webhook, публичный (проверка подписи внутри)
-    "POST /api/v1/payments/click/complete": [],
-
-    # Merchants
+    "POST /api/v1/auth/logout": _ALL_ROLES,
+    # --- Личный кабинет ---
+    # Профиль нужен всем ролям: фронтенд не разбирает JWT самостоятельно.
+    "GET /api/v1/me": _ALL_ROLES,
+    "GET /api/v1/me/redemptions": [UserRole.EMPLOYEE],
+    "GET /api/v1/me/promo-codes": [UserRole.EMPLOYEE],
+    # --- Каталог сотрудника ---
+    "GET /api/v1/benefits": [UserRole.EMPLOYEE],
+    "GET /api/v1/benefits/{benefit_id}": [UserRole.EMPLOYEE],
+    "POST /api/v1/benefits/{benefit_id}/redeem": [UserRole.EMPLOYEE],
+    # --- Льготы мерчанта ---
+    "GET /api/v1/merchant/benefits": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/merchant/benefits": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/merchant/benefits/{benefit_id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "PATCH /api/v1/merchant/benefits/{benefit_id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "DELETE /api/v1/merchant/benefits/{benefit_id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/merchant/analytics": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    # --- Подтверждение промокода ---
+    "GET /api/v1/merchant/promo-codes/{code}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/merchant/promo-codes/{code}/redeem": [
+        UserRole.MERCHANT,
+        UserRole.PLATFORM_ADMIN,
+    ],
+    # --- Управление компанией ---
+    "GET /api/v1/company": [UserRole.COMPANY_ADMIN],
+    "GET /api/v1/company/seats": [UserRole.COMPANY_ADMIN],
+    "GET /api/v1/company/employees": [UserRole.COMPANY_ADMIN],
+    "POST /api/v1/company/invites": [UserRole.COMPANY_ADMIN],
+    "GET /api/v1/company/invites": [UserRole.COMPANY_ADMIN],
+    "POST /api/v1/company/employees/{user_id}/plan": [UserRole.COMPANY_ADMIN],
+    "POST /api/v1/company/employees/{user_id}/deactivate": [UserRole.COMPANY_ADMIN],
+    "GET /api/v1/company/analytics": [UserRole.COMPANY_ADMIN],
+    # --- Мерчанты (управление платформой) ---
     "GET /api/v1/merchants": [UserRole.PLATFORM_ADMIN],
-    "GET /api/v1/merchants/{id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/merchants/{merchant_id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
     "POST /api/v1/merchants": [UserRole.PLATFORM_ADMIN],
-    "PATCH /api/v1/merchants/{id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
-    "POST /api/v1/merchants/{id}/block": [UserRole.PLATFORM_ADMIN],
-    "POST /api/v1/merchants/{id}/unblock": [UserRole.PLATFORM_ADMIN],
-
-    # Company
-    "GET /api/v1/companies/{id}": [UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
-    "GET /api/v1/companies/{id}/employees": [UserRole.COMPANY_ADMIN],
-    "GET /api/v1/companies/{id}/budget": [UserRole.COMPANY_ADMIN],
-    "PATCH /api/v1/companies/{id}/budget": [UserRole.COMPANY_ADMIN],
-    "GET /api/v1/companies/{id}/analytics": [UserRole.COMPANY_ADMIN],
-
-    # Admin
+    "PATCH /api/v1/merchants/{merchant_id}": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/merchants/{merchant_id}/block": [UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/merchants/{merchant_id}/unblock": [UserRole.PLATFORM_ADMIN],
+    # --- Компании (управление платформой) ---
+    "GET /api/v1/companies": [UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/companies": [UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/companies/{company_id}": [UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
+    "PATCH /api/v1/companies/{company_id}": [UserRole.PLATFORM_ADMIN],
+    "PUT /api/v1/companies/{company_id}/allocations": [UserRole.PLATFORM_ADMIN],
+    # --- Платформенный админ ---
     "GET /api/v1/admin/users": [UserRole.PLATFORM_ADMIN],
-    "PATCH /api/v1/admin/users/{id}/block": [UserRole.PLATFORM_ADMIN],
-    "PATCH /api/v1/admin/users/{id}/unblock": [UserRole.PLATFORM_ADMIN],
-    "GET /api/v1/admin/payments": [UserRole.PLATFORM_ADMIN],
+    "PATCH /api/v1/admin/users/{user_id}/block": [UserRole.PLATFORM_ADMIN],
+    "PATCH /api/v1/admin/users/{user_id}/unblock": [UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/admin/promo-codes": [UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/admin/promo-codes/{code}/redeem": [UserRole.PLATFORM_ADMIN],
+    "POST /api/v1/admin/promo-codes/{code}/revoke": [UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/admin/redemptions": [UserRole.PLATFORM_ADMIN],
     "GET /api/v1/admin/audit-logs": [UserRole.PLATFORM_ADMIN],
-
-    # AI
+    # --- Realtime ---
+    "POST /api/v1/events/ticket": _ALL_ROLES,
+    # Поток аутентифицируется одноразовым тикетом из Redis, а не Bearer-заголовком:
+    # EventSource в браузере заголовки отправлять не умеет.
+    "GET /api/v1/events/stream": [],
+    # --- AI ---
     "POST /api/v1/ai/concierge": [UserRole.EMPLOYEE],
-    "POST /api/v1/ai/merchant-assistant": [UserRole.MERCHANT],
-    "POST /api/v1/ai/company-insights": [UserRole.COMPANY_ADMIN],
+    "POST /api/v1/ai/merchant/generate-offer": [UserRole.MERCHANT, UserRole.PLATFORM_ADMIN],
+    "GET /api/v1/ai/company-report": [UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN],
 }

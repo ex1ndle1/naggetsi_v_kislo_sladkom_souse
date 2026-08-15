@@ -41,7 +41,7 @@ async def list_merchants(
     # Пагинация
     stmt = stmt.offset((page - 1) * page_size).limit(page_size).order_by(Merchant.created_at.desc())
     result = await db.scalars(stmt)
-    items = list(result.all())
+    items = [MerchantResponse.model_validate(merchant) for merchant in result.all()]
 
     return MerchantListResponse(
         items=items,

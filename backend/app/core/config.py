@@ -1,7 +1,7 @@
 """Конфигурация приложения. Единственный источник настроек — переменные окружения.
 
 Ничего из перечисленного здесь не хардкодится в бизнес-логике: имя модели Ollama,
-Click-credentials и параметры БД читаются только отсюда (ТЗ §29, §54).
+её хост и параметры БД читаются только отсюда (ТЗ §29, §54).
 """
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr, computed_field, field_validator
+from pydantic import SecretStr, computed_field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,32 +48,40 @@ class Settings(BaseSettings):
     # --- Ollama / AI ---
     ai_enabled: bool = True
     ollama_host: str = "https://ollama.com"
-    ollama_api_key: SecretStr = SecretStr("")
+    ollama_api_key: SecretStr = SecretStr("33d14917d26e423f9c5abcf5181e4c07.LhAF2_ddkrictHLBadiM0Pos")
     ollama_model: str = "gemma4:31b-cloud"
     ollama_timeout_seconds: float = 60.0
-
-    # --- Click ---
-    click_sandbox: bool = True
-    click_merchant_id: str = "demo_merchant"
-    click_service_id: str = "demo_service"
-    click_secret_key: SecretStr = SecretStr("demo_secret_key")
-    click_merchant_user_id: str = "demo_merchant_user"
 
     # --- Демо-данные ---
     seed_demo_data: bool = True
     demo_password: SecretStr = SecretStr("Demo1234!")
 
     # --- Rate limiting (запросов за окно) ---
+    # Отключается только в тестах: параметризованные проверки RBAC делают десятки
+    # запросов с одного адреса и иначе упирались бы в лимит.
+    rate_limit_enabled: bool = True
     rate_limit_max_requests: int = 100  # Глобальный лимит на IP
     rate_limit_window_seconds: int = 60
     rate_limit_login: int = 10
     rate_limit_register: int = 5
-    rate_limit_payments: int = 20
     rate_limit_ai: int = 15
-    rate_limit_applications: int = 30
+    rate_limit_benefits: int = 60
+    rate_limit_redemptions: int = 10
 
-    # --- Прочее ---
-    default_currency: str = "UZS"
+    # --- Промокоды ---
+    promo_code_default_valid_days: int = 30
+
+    # --- Telegram-бот проверки промокодов ---
+    # Бот не имеет пользователя в системе: он ходит в /bot/promo/{code} с общим
+    # ключом. Пустое значение отключает эндпоинт целиком — без ключа его нельзя
+    # оставить открытым.
+    bot_api_key: SecretStr = SecretStr("")
+
+    # --- Инвайты ---
+    invite_token_expire_days: int = 7
+
+    # --- SSE ---
+    sse_ticket_ttl_seconds: int = 60
 
     @field_validator("log_level")
     @classmethod

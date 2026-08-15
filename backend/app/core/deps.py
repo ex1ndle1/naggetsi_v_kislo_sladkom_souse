@@ -12,14 +12,11 @@ from uuid import UUID
 
 import jwt
 from fastapi import Depends, Header
-from redis.asyncio import Redis
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.core.enums import UserRole
+from app.core.enums import UserPlan, UserRole
 from app.core.errors import Forbidden, Unauthenticated
-from app.core.redis import get_redis
 from app.core.security import decode_token
 
 __all__ = [
@@ -43,6 +40,8 @@ class AuthUser:
     role: UserRole
     company_id: UUID | None
     merchant_id: UUID | None
+    # Тариф сотрудника. None у мерчантов и админов — у них нет каталога.
+    plan: UserPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -56,9 +55,12 @@ class TenantContext:
 
 async def get_current_user(
     authorization: Annotated[str | None, Header()] = None,
-    redis: Redis = Depends(get_redis),
 ) -> AuthUser:
     """Извлекает и валидирует JWT access-токен из заголовка Authorization.
+
+    Денилист здесь не проверяется: отзываются refresh-токены (``app/users/service.py``),
+    а access живёт 15 минут — обращение в Redis на каждый запрос API стоило бы
+    дороже, чем даёт сокращение этого окна.
 
     Raises:
         Unauthenticated: если токен отсутствует, невалиден или просрочен.
@@ -90,21 +92,19 @@ async def get_current_user(
         raise Unauthenticated(message="Invalid token claims") from e
 
     # Извлекаем опциональные tenant-поля
-    company_id = UUID(payload["company_id"]) if payload.get("company_id") else None
-    merchant_id = UUID(payload["merchant_id"]) if payload.get("merchant_id") else None
-
-    # Проверка jti-denylist для logout (только для refresh, но можно и для access).
-    # Для access-токенов обычно не используется, т.к. короткий TTL.
-    # Если нужна поддержка немедленной инвалидации access — раскомментировать:
-    # jti = payload.get("jti")
-    # if jti and await redis.exists(f"denylist:{jti}"):
-    #     raise Unauthenticated(message="Token has been revoked")
+    try:
+        company_id = UUID(payload["company_id"]) if payload.get("company_id") else None
+        merchant_id = UUID(payload["merchant_id"]) if payload.get("merchant_id") else None
+        plan = UserPlan(payload["plan"]) if payload.get("plan") else None
+    except ValueError as e:
+        raise Unauthenticated(message="Invalid token claims") from e
 
     return AuthUser(
         user_id=user_id,
         role=role,
         company_id=company_id,
         merchant_id=merchant_id,
+        plan=plan,
     )
 
 
@@ -148,9 +148,7 @@ def require_roles(
 
     def _check_role(user: CurrentUser) -> AuthUser:
         if user.role not in allowed:
-            raise Forbidden(
-                message=f"Access denied: requires one of {sorted(r.value for r in allowed)}"
-            )
+            raise Forbidden(message=f"Access denied: requires one of {sorted(r.value for r in allowed)}")
         return user
 
     return _check_role

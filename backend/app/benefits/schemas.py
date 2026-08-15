@@ -8,16 +8,17 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.core.enums import BenefitCategory, UserPlan
+from app.core.enums import BenefitCategory, RedemptionStatus, UserPlan
 
 __all__ = [
     "BenefitCreateRequest",
-    "BenefitUpdateRequest",
-    "BenefitListItem",
     "BenefitDetailResponse",
+    "BenefitListItem",
+    "BenefitUpdateRequest",
     "MerchantBenefitResponse",
     "PlanOfferInput",
     "PlanOfferResponse",
+    "RedeemResponse",
 ]
 
 
@@ -93,9 +94,7 @@ class BenefitUpdateRequest(BaseModel):
 
     @field_validator("plan_offers")
     @classmethod
-    def _unique_plans(
-        cls, offers: list[PlanOfferInput] | None
-    ) -> list[PlanOfferInput] | None:
+    def _unique_plans(cls, offers: list[PlanOfferInput] | None) -> list[PlanOfferInput] | None:
         if offers is None:
             return None
         plans = [offer.plan for offer in offers]
@@ -128,6 +127,20 @@ class BenefitDetailResponse(BenefitListItem):
     max_redemptions_per_employee: int
     promo_valid_days: int
     redemptions_left: int
+
+
+class RedeemResponse(BaseModel):
+    """Результат выдачи промокода (NEXUS30 §29).
+
+    Код возвращается один раз в этом ответе и далее доступен через историю
+    ``GET /me/promo-codes`` — он не секрет, но и не выводится в списке каталога.
+    """
+
+    redemption_id: UUID
+    promo_code: str
+    expires_at: datetime
+    status: RedemptionStatus
+    message: str
 
 
 class MerchantBenefitResponse(BaseModel):

@@ -1,7 +1,9 @@
 """Структурное JSON-логирование (ТЗ §45).
 
-Логируем: запросы, аутентификацию, платёжные события, отказы anti-fraud, ошибки AI и БД.
-Не логируем: пароли, JWT-секреты, Click-секреты, персональные данные.
+Логируем: запросы, аутентификацию, выдачу и подтверждение промокодов, отказы по
+лимитам и злоупотреблениям, ошибки AI и БД.
+
+Не логируем: пароли, JWT-секреты, plaintext инвайтов и промокодов, тикеты SSE.
 За это отвечает ``_redact_processor`` — он вычищает чувствительные ключи на выходе,
 чтобы случайно переданное значение не попало в лог.
 """
@@ -10,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Mapping, MutableMapping
 from typing import Any
 
 import structlog
@@ -29,11 +32,12 @@ _SENSITIVE_KEYS = frozenset(
         "jwt_secret",
         "secret",
         "secret_key",
-        "click_secret_key",
-        "sign_string",
         "api_key",
         "ollama_api_key",
-        "card_number",
+        "invite_token",
+        "token_hash",
+        "promo_code",
+        "ticket",
     }
 )
 
@@ -41,9 +45,16 @@ _REDACTED = "[redacted]"
 
 
 def _redact_processor(
-    _logger: Any, _method: str, event_dict: dict[str, Any]
-) -> dict[str, Any]:
-    """Заменяет значения чувствительных ключей на маркер."""
+    _logger: Any,
+    _method: str,
+    event_dict: MutableMapping[str, Any],
+) -> Mapping[str, Any]:
+    """Заменяет значения чувствительных ключей на маркер.
+
+    Тип соответствует structlog.typing.Processor: на вход приходит изменяемое
+    отображение, наружу отдаётся неизменяемый интерфейс — сузив аннотацию до
+    dict, обработчик перестаёт подходить в цепочку по типам.
+    """
     for key in list(event_dict):
         if key.lower() in _SENSITIVE_KEYS:
             event_dict[key] = _REDACTED

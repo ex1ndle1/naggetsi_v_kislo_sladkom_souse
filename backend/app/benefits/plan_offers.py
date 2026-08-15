@@ -16,10 +16,12 @@ from uuid import UUID
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
-    Enum as SAEnum,
     ForeignKey,
     Numeric,
     UniqueConstraint,
+)
+from sqlalchemy import (
+    Enum as SAEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -34,20 +36,17 @@ class BenefitPlanOffer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "benefit_plan_offers"
     __table_args__ = (
         UniqueConstraint("benefit_id", "plan", name="uq_benefit_plan_offer"),
+        # Без префикса ck_: его добавит NAMING_CONVENTION вместе с именем таблицы.
         CheckConstraint(
             "discount_percent >= 0 AND discount_percent <= 100",
-            name="ck_discount_percent_range",
+            name="discount_percent_range",
         ),
     )
 
-    benefit_id: Mapped[UUID] = mapped_column(
-        ForeignKey("benefits.id", ondelete="CASCADE"), nullable=False, index=True
-    )
+    benefit_id: Mapped[UUID] = mapped_column(ForeignKey("benefits.id", ondelete="CASCADE"), nullable=False, index=True)
     benefit: Mapped[Benefit] = relationship(back_populates="plan_offers")
 
-    plan: Mapped[UserPlan] = mapped_column(
-        SAEnum(UserPlan, name="user_plan"), nullable=False, index=True
-    )
+    plan: Mapped[UserPlan] = mapped_column(SAEnum(UserPlan, name="user_plan"), nullable=False, index=True)
     discount_percent: Mapped[Decimal] = mapped_column(
         Numeric(5, 2), nullable=False, comment="Процент скидки: 0.00-100.00"
     )

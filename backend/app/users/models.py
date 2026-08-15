@@ -10,7 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import Boolean, Enum as SAEnum, ForeignKey, String
+from sqlalchemy import Boolean, ForeignKey, String
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -28,15 +29,11 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     first_name: Mapped[str] = mapped_column(String(100), nullable=False)
     last_name: Mapped[str] = mapped_column(String(100), nullable=False)
-    role: Mapped[UserRole] = mapped_column(
-        SAEnum(UserRole, name="user_role"), nullable=False, index=True
-    )
+    role: Mapped[UserRole] = mapped_column(SAEnum(UserRole, name="user_role"), nullable=False, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, index=True)
 
     # NEXUS30: план доступа (STANDARD/PLUS/PRO). NULL только для MERCHANT/PLATFORM_ADMIN.
-    plan: Mapped[UserPlan | None] = mapped_column(
-        SAEnum(UserPlan, name="user_plan"), nullable=True, index=True
-    )
+    plan: Mapped[UserPlan | None] = mapped_column(SAEnum(UserPlan, name="user_plan"), nullable=True, index=True)
 
     # EMPLOYEE / COMPANY_ADMIN → company_id заполнено, иначе NULL.
     company_id: Mapped[UUID | None] = mapped_column(

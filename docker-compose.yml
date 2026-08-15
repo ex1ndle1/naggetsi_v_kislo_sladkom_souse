@@ -36,30 +36,32 @@ services:
     networks:
       - benefits_network
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: benefits_ollama
-    volumes:
-      - ollama:/root/.ollama
-    ports:
-      - "${OLLAMA_PORT:-11434}:11434"
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      - benefits_network
+  # ollama:
+  #   image: ollama/ollama:latest
+  #   container_name: benefits_ollama
+  #   volumes:
+  #     - ollama:/root/.ollama
+  #   ports:
+  #     - "${OLLAMA_PORT:-11434}:11434"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "ollama list || exit 1"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 3
+  #     start_period: 30s
+  #   restart: unless-stopped
+  #   networks:
+  #     - benefits_network
+  # Note: Using host Ollama systemd service at 127.0.0.1:11434
 
+  # Схема создаётся только миграциями (ТЗ §30, §39): create_all() в коде нет.
   migrate:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: benefits_migrate
     command: migrate
-    environment:
+    environment: &db_env
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-benefits}
@@ -78,11 +80,7 @@ services:
     container_name: benefits_seeds
     command: seed
     environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-benefits}
-      POSTGRES_USER: ${POSTGRES_USER:-benefits_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits_pass}
+      <<: *db_env
       SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
       DEMO_PASSWORD: ${DEMO_PASSWORD:-Demo1234!}
     depends_on:
@@ -95,33 +93,41 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        # В локальной сборке нужны pytest/ruff/mypy: проверки §52 запускаются
+        # внутри контейнера. Для production-сборки передаётся false.
+        INSTALL_DEV: ${INSTALL_DEV:-true}
     container_name: benefits_backend
     command: serve
     environment:
+      <<: *db_env
       PROJECT_NAME: "Corporate Benefits Platform"
+      APP_ENV: ${APP_ENV:-development}
       DEBUG: ${DEBUG:-false}
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: ${POSTGRES_DB:-benefits}
-      POSTGRES_USER: ${POSTGRES_USER:-benefits_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-benefits_pass}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
       REDIS_URL: redis://redis:6379/0
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
       JWT_ALGORITHM: HS256
-      JWT_ACCESS_TOKEN_EXPIRE_MINUTES: 15
-      JWT_REFRESH_TOKEN_EXPIRE_DAYS: 7
+      JWT_ACCESS_EXPIRE_MINUTES: 15
+      JWT_REFRESH_EXPIRE_DAYS: 7
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://localhost:3000}
-      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
       AI_ENABLED: ${AI_ENABLED:-true}
-      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-30}
-      CLICK_SERVICE_ID: ${CLICK_SERVICE_ID}
-      CLICK_MERCHANT_ID: ${CLICK_MERCHANT_ID}
-      CLICK_SECRET_KEY: ${CLICK_SECRET_KEY}
-      CLICK_MERCHANT_USER_ID: ${CLICK_MERCHANT_USER_ID}
-      CLICK_SANDBOX: ${CLICK_SANDBOX:-true}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-30}
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-10}
+      RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-5}
+      RATE_LIMIT_AI: ${RATE_LIMIT_AI:-15}
+      RATE_LIMIT_BENEFITS: ${RATE_LIMIT_BENEFITS:-60}
+      RATE_LIMIT_REDEMPTIONS: ${RATE_LIMIT_REDEMPTIONS:-10}
+      PROMO_CODE_DEFAULT_VALID_DAYS: ${PROMO_CODE_DEFAULT_VALID_DAYS:-30}
+      INVITE_TOKEN_EXPIRE_DAYS: ${INVITE_TOKEN_EXPIRE_DAYS:-7}
+      SSE_TICKET_TTL_SECONDS: ${SSE_TICKET_TTL_SECONDS:-60}
+      BOT_API_KEY: ${BOT_API_KEY:-}
     ports:
       - "8000:8000"
     depends_on:
@@ -160,6 +166,26 @@ services:
     networks:
       - benefits_network
 
+  # Проверка промокодов в Telegram. Отдельный сервис: падение бота не должно
+  # влиять на API, а перезапуск API не требует пересборки бота.
+  tg_bot:
+    build:
+      context: ./tg_bot
+      dockerfile: Dockerfile
+    container_name: benefits_tg_bot
+    environment:
+      # Без :? — иначе отсутствие токена ломает любую docker compose команду,
+      # включая работу с остальными сервисами. Проверку делает сам bot.py.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      BACKEND_URL: http://backend:8000
+      BOT_API_KEY: ${BOT_API_KEY:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - benefits_network
+
   nginx:
     build:
       context: ./nginx
@@ -186,8 +212,8 @@ volumes:
     name: benefits_pgdata
   redisdata:
     name: benefits_redisdata
-  ollama:
-    name: benefits_ollama
+  # ollama:
+  #   name: benefits_ollama
 
 networks:
   benefits_network:

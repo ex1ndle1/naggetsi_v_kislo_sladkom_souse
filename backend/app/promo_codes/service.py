@@ -3,19 +3,20 @@
 Выдача кодов, валидация, redemption (merchant/admin подтверждает использование).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
-from app.core.errors import BadRequest, Conflict, NotFound
 from app.core.enums import PromoCodeStatus
+from app.core.errors import BadRequest, Conflict, NotFound
 from app.promo_codes.generator import generate_promo_code
 from app.promo_codes.models import PromoCode
 
-__all__ = ["issue_promo_code", "redeem_promo_code", "expire_old_codes"]
+__all__ = ["expire_old_codes", "issue_promo_code", "redeem_promo_code"]
 
 
 async def issue_promo_code(
@@ -45,31 +46,35 @@ async def issue_promo_code(
     Raises:
         Conflict: не удалось сгенерировать уникальный код за max_attempts попыток
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     expires_at = now + timedelta(days=promo_valid_days)
 
     for attempt in range(max_attempts):
         code = generate_promo_code(merchant_name)
 
-        promo = PromoCode(
-            code=code,
-            benefit_id=benefit_id,
-            employee_id=employee_id,
-            redemption_id=redemption_id,
-            status=PromoCodeStatus.ISSUED,
-            issued_at=now,
-            expires_at=expires_at,
-        )
-        db.add(promo)
-
+        # Savepoint, а не общая транзакция: коллизия кода откатывает только вставку
+        # промокода. Обычный rollback() выбросил бы и BenefitRedemption, созданный
+        # вызывающим сервисом в этой же транзакции.
         try:
-            await db.flush()
+            async with db.begin_nested():
+                promo = PromoCode(
+                    code=code,
+                    benefit_id=benefit_id,
+                    employee_id=employee_id,
+                    redemption_id=redemption_id,
+                    status=PromoCodeStatus.ISSUED,
+                    issued_at=now,
+                    expires_at=expires_at,
+                )
+                db.add(promo)
+                await db.flush()
             return promo
         except IntegrityError:
-            await db.rollback()
-            # Коллизия по unique constraint — повторяем генерацию.
             if attempt == max_attempts - 1:
-                raise Conflict(message="Failed to generate unique promo code")
+                raise Conflict(
+                    message="Failed to generate unique promo code",
+                    details={"attempts": max_attempts},
+                ) from None
             continue
 
     raise Conflict(message="Failed to generate unique promo code")
@@ -86,9 +91,14 @@ async def redeem_promo_code(
         NotFound: код не найден
         BadRequest: код уже использован / истёк / отозван
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
-    stmt = select(PromoCode).where(PromoCode.code == code.upper().strip())
+    stmt = (
+        select(PromoCode)
+        .where(PromoCode.code == code.upper().strip())
+        .options(selectinload(PromoCode.redemption))
+        .with_for_update()
+    )
     promo = await db.scalar(stmt)
 
     if not promo:
@@ -116,7 +126,7 @@ async def expire_old_codes(db: AsyncSession) -> int:
     Returns:
         Количество обновлённых записей.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     stmt = select(PromoCode).where(
         PromoCode.status == PromoCodeStatus.ISSUED,

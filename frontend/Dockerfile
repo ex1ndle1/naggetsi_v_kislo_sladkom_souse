@@ -2,32 +2,24 @@ FROM node:20-alpine AS builder
 
 WORKDIR /build
 
-COPY package*.json ./
-RUN npm ci --only=production && npm cache clean --force
+# Зависимости отдельным слоем: он переиспользуется, пока не менялся package-lock.json.
+COPY package.json package-lock.json ./
+# Не --omit=dev: vite, tsc и tailwind лежат в devDependencies, и без них
+# `npm run build` не запустится вовсе.
+RUN npm ci --no-audit --no-fund
 
 COPY . .
 RUN npm run build
 
 # ---------------------------------------------------------------------------
-FROM nginx:1.25-alpine
+FROM nginx:1.27-alpine
 
 COPY --from=builder /build/dist /usr/share/nginx/html
-
-# Конфигурация nginx для SPA (history fallback)
-RUN echo 'server { \
-    listen 80; \
-    server_name _; \
-    root /usr/share/nginx/html; \
-    index index.html; \
-    location / { \
-        try_files $uri $uri/ /index.html; \
-    } \
-    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ { \
-        expires 1y; \
-        add_header Cache-Control "public, immutable"; \
-    } \
-}' > /etc/nginx/conf.d/default.conf
+COPY nginx-spa.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
+
+# curl нужен healthcheck'у из docker-compose.yml; в базовом образе его нет.
+RUN apk add --no-cache curl
 
 CMD ["nginx", "-g", "daemon off;"]

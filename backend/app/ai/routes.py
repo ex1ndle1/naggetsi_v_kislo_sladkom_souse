@@ -1,200 +1,241 @@
-"""AI router: персонализированные рекомендации и аналитика."""
+"""AI router: консьерж сотрудника, ассистент мерчанта, отчёт компании (NEXUS30 §17-§19).
+
+Общее для всех трёх: выборка данных делается SQL-слоем под правами вызывающего, и
+только результат этой выборки уходит в модель. AI не расширяет доступ и не влияет на
+решения о выдаче льгот — при его недоступности эндпоинты отвечают деградированно,
+но не ошибкой.
+"""
+
+from __future__ import annotations
 
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 
-from app.ai.service import assess_fraud_risk, generate_company_report, get_benefit_recommendations
-from app.applications.models import Application
-from app.benefits.models import Benefit
-from app.core.deps import CurrentUser, DbSession, require_roles
-from app.core.enums import ApplicationStatus, UserRole
-from app.core.errors import BadRequest, Forbidden, NotFound
+from app.ai.service import (
+    ConciergeResult,
+    MerchantDraft,
+    company_insights,
+    generate_offer_draft,
+    rank_benefits_for_employee,
+)
+from app.analytics.service import company_analytics
+from app.audit.service import record_audit
+from app.benefits.visibility import discount_for_plan, visible_benefits_query
+from app.core.config import settings
+from app.core.deps import AuthUser, DbSession, require_roles
+from app.core.enums import AuditAction, UserRole
+from app.core.errors import BadRequest
+from app.core.rate_limit import rate_limit
+from app.merchants.models import Merchant
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
-
-class RecommendationsResponse(BaseModel):
-    """Рекомендации льгот для сотрудника."""
-
-    recommended: list[UUID]
-    fallback_used: bool
+# Сколько льгот отдаём модели. Ограничение не косметическое: длинный контекст режет
+# качество ранжирования и упирается в таймаут.
+_CONCIERGE_CATALOG_LIMIT = 40
 
 
-class FraudAssessmentRequest(BaseModel):
-    """Запрос оценки fraud риска."""
-
-    application_id: UUID
+class ConciergeRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=500)
 
 
-class FraudAssessmentResponse(BaseModel):
-    """Результат оценки fraud."""
+class ConciergeBenefit(BaseModel):
+    """Льгота в ответе консьержа — с процентом скидки для тарифа сотрудника."""
 
-    risk_score: float
-    reason: str
-    blocked: bool
+    id: UUID
+    title: str
+    category: str
+    merchant_name: str
+    your_discount_percent: float
+
+
+class ConciergeResponse(BaseModel):
+    benefits: list[ConciergeBenefit]
+    reasoning: str | None = None
+    ai_used: bool
+
+
+class OfferDraftRequest(BaseModel):
+    hint: str = Field(min_length=5, max_length=2000, description="Описание льготы словами мерчанта")
+
+
+class OfferDraftResponse(BaseModel):
+    draft: MerchantDraft | None
+    ai_used: bool
+    message: str | None = None
 
 
 class CompanyReportResponse(BaseModel):
-    """Аналитический отчёт компании."""
+    metrics: dict[str, object]
+    insights: str | None
+    ai_used: bool
 
-    report: str
-    fallback_used: bool
 
-
-@router.get("/recommendations", response_model=RecommendationsResponse)
-async def get_recommendations(
+@router.post(
+    "/concierge",
+    response_model=ConciergeResponse,
+    dependencies=[Depends(rate_limit("ai", settings.rate_limit_ai))],
+)
+async def concierge(
+    payload: ConciergeRequest,
     db: DbSession,
-    user: Annotated[CurrentUser, Depends(require_roles(UserRole.EMPLOYEE))],
-) -> RecommendationsResponse:
-    """Персонализированные рекомендации льгот (AI сценарий 1).
+    user: Annotated[AuthUser, Depends(require_roles(UserRole.EMPLOYEE))],
+) -> ConciergeResponse:
+    """Сценарий 1: подбор льгот под запрос сотрудника.
 
-    Fallback: сортировка по популярности (количество заявок).
+    Каталог берётся тем же ``visible_benefits_query``, что и обычный список, поэтому
+    консьерж физически не может предложить льготу вне тарифа или чужой компании.
     """
-    if not user.company_id:
-        raise BadRequest(message="Employee must be associated with a company")
+    if not user.company_id or not user.plan:
+        raise BadRequest(message="Employee must have a company and a plan")
 
-    # Получаем доступные льготы
-    stmt = select(Benefit).where(
-        Benefit.is_active == True,  # noqa: E712
-        (Benefit.company_id.is_(None)) | (Benefit.company_id == user.company_id),
-    )
-    benefits = list((await db.scalars(stmt)).all())
+    stmt = visible_benefits_query(user.plan, user.company_id).limit(_CONCIERGE_CATALOG_LIMIT)
+    benefits = list((await db.scalars(stmt)).unique().all())
 
-    if not benefits:
-        return RecommendationsResponse(recommended=[], fallback_used=True)
-
-    # Пробуем AI рекомендации
-    employee_profile = {
-        "role": user.role.value,
-        "company_id": str(user.company_id),
-        "user_id": str(user.user_id),
-    }
-    benefits_data = [
-        {
-            "id": str(b.id),
-            "title": b.title,
-            "category": b.category.value,
-            "price": float(b.price),
-        }
-        for b in benefits
-    ]
-
-    ai_recommendations = await get_benefit_recommendations(employee_profile, benefits_data)
-
-    if ai_recommendations:
-        # AI вернул результат
-        recommended_ids = [UUID(bid) for bid in ai_recommendations if bid in [str(b.id) for b in benefits]]
-        return RecommendationsResponse(recommended=recommended_ids, fallback_used=False)
-
-    # Fallback: сортировка по популярности
-    popularity_stmt = (
-        select(Benefit.id, func.count(Application.id).label("count"))
-        .outerjoin(Application, Benefit.id == Application.benefit_id)
-        .where(Benefit.id.in_([b.id for b in benefits]))
-        .group_by(Benefit.id)
-        .order_by(func.count(Application.id).desc())
-    )
-    popular = await db.execute(popularity_stmt)
-    recommended_ids = [row[0] for row in popular.all()]
-
-    return RecommendationsResponse(recommended=recommended_ids, fallback_used=True)
-
-
-@router.post("/fraud-check", response_model=FraudAssessmentResponse)
-async def check_fraud(
-    payload: FraudAssessmentRequest,
-    db: DbSession,
-    user: Annotated[CurrentUser, Depends(require_roles(UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN))],
-) -> FraudAssessmentResponse:
-    """Оценка риска fraud для заявки (AI сценарий 2).
-
-    Fallback: пропускаем проверку (risk_score=0.0).
-    """
-    # Проверяем заявку
-    stmt = select(Application).where(Application.id == payload.application_id)
-    application = await db.scalar(stmt)
-
-    if not application:
-        raise NotFound(message="Application not found")
-
-    # Tenant isolation
-    if user.role == UserRole.COMPANY_ADMIN and application.company_id != user.company_id:
-        raise Forbidden(message="Access denied")
-
-    # AI оценка fraud
-    application_data = {
-        "id": str(application.id),
-        "employee_id": str(application.employee_id),
-        "benefit_id": str(application.benefit_id),
-        "price": float(application.price),
-        "status": application.status.value,
-    }
-
-    assessment = await assess_fraud_risk(application_data)
-
-    if assessment:
-        return FraudAssessmentResponse(
-            risk_score=assessment["risk_score"],
-            reason=assessment["reason"],
-            blocked=assessment["blocked"],
+    catalog: list[dict[str, object]] = []
+    by_id = {}
+    for benefit in benefits:
+        offer = discount_for_plan(benefit, user.plan)
+        if offer is None:
+            continue
+        by_id[benefit.id] = (benefit, offer)
+        catalog.append(
+            {
+                "id": str(benefit.id),
+                "title": benefit.title,
+                "category": benefit.category.value,
+                "description": benefit.description[:300],
+                "discount_percent": float(offer.discount_percent),
+                "merchant": benefit.merchant.name,
+            }
         )
 
-    # Fallback: нет AI — пропускаем
-    return FraudAssessmentResponse(risk_score=0.0, reason="AI unavailable", blocked=False)
+    result: ConciergeResult = await rank_benefits_for_employee(
+        query=payload.query,
+        eligible=catalog,
+        employee_context={"plan": user.plan.value},
+    )
+
+    record_audit(
+        db,
+        action=AuditAction.AI_REQUEST if result.ai_used else AuditAction.AI_ERROR,
+        actor_id=user.user_id,
+        company_id=user.company_id,
+        entity_type="ai_concierge",
+        meta={"catalog_size": len(catalog), "ai_used": result.ai_used},
+    )
+    await db.commit()
+
+    ordered: list[ConciergeBenefit] = []
+    for benefit_id in result.benefit_ids:
+        entry = by_id.get(benefit_id)
+        if entry is None:
+            continue
+        benefit, offer = entry
+        ordered.append(
+            ConciergeBenefit(
+                id=benefit.id,
+                title=benefit.title,
+                category=benefit.category.value,
+                merchant_name=benefit.merchant.name,
+                your_discount_percent=float(offer.discount_percent),
+            )
+        )
+
+    return ConciergeResponse(
+        benefits=ordered,
+        reasoning=result.reasoning,
+        ai_used=result.ai_used,
+    )
 
 
-@router.get("/company-report", response_model=CompanyReportResponse)
+@router.post(
+    "/merchant/generate-offer",
+    response_model=OfferDraftResponse,
+    dependencies=[Depends(rate_limit("ai", settings.rate_limit_ai))],
+)
+async def generate_offer(
+    payload: OfferDraftRequest,
+    db: DbSession,
+    user: Annotated[AuthUser, Depends(require_roles(UserRole.MERCHANT, UserRole.PLATFORM_ADMIN))],
+) -> OfferDraftResponse:
+    """Сценарий 2: черновик описания льготы.
+
+    Черновик ничего не публикует. Мерчант правит текст и создаёт льготу обычным
+    ``POST /merchant/benefits`` — скидки и сроки задаёт человек, а не модель.
+    """
+    merchant_name = "Merchant"
+    if user.merchant_id:
+        merchant = await db.get(Merchant, user.merchant_id)
+        if merchant is not None:
+            merchant_name = merchant.name
+
+    result = await generate_offer_draft(merchant_name=merchant_name, hint=payload.hint)
+
+    record_audit(
+        db,
+        action=AuditAction.AI_REQUEST if result else AuditAction.AI_ERROR,
+        actor_id=user.user_id,
+        entity_type="ai_offer_draft",
+        entity_id=user.merchant_id,
+        meta={"ai_used": result is not None},
+    )
+    await db.commit()
+
+    if result is None:
+        return OfferDraftResponse(
+            draft=None,
+            ai_used=False,
+            message="AI unavailable — fill the offer manually",
+        )
+    return OfferDraftResponse(draft=result.draft, ai_used=True)
+
+
+@router.get(
+    "/company-report",
+    response_model=CompanyReportResponse,
+    dependencies=[Depends(rate_limit("ai", settings.rate_limit_ai))],
+)
 async def get_company_report(
     db: DbSession,
-    user: Annotated[CurrentUser, Depends(require_roles(UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN))],
+    user: Annotated[AuthUser, Depends(require_roles(UserRole.COMPANY_ADMIN, UserRole.PLATFORM_ADMIN))],
+    company_id: UUID | None = None,
 ) -> CompanyReportResponse:
-    """Генерация аналитического отчёта компании (AI сценарий 3).
+    """Сценарий 3: рекомендации по метрикам компании.
 
-    Fallback: базовая статистика без AI-анализа.
+    Числовая часть отчёта считается в SQL и возвращается всегда; текст модели —
+    дополнение. COMPANY_ADMIN видит только свою компанию, платформенный админ может
+    указать любую параметром.
     """
-    if user.role == UserRole.COMPANY_ADMIN and not user.company_id:
-        raise BadRequest(message="COMPANY_ADMIN must be associated with a company")
+    if user.role == UserRole.COMPANY_ADMIN:
+        if not user.company_id:
+            raise BadRequest(message="COMPANY_ADMIN must be associated with a company")
+        target_company = user.company_id
+    else:
+        if company_id is None:
+            raise BadRequest(message="company_id is required for platform admin")
+        target_company = company_id
 
-    company_id = user.company_id if user.role == UserRole.COMPANY_ADMIN else None
+    analytics = await company_analytics(db, target_company)
+    metrics = analytics.to_prompt_payload()
+    insights = await company_insights(metrics=metrics)
 
-    # Собираем данные для отчёта
-    applications_stmt = select(Application)
-    if company_id:
-        applications_stmt = applications_stmt.where(Application.company_id == company_id)
+    record_audit(
+        db,
+        action=AuditAction.AI_REQUEST if insights else AuditAction.AI_ERROR,
+        actor_id=user.user_id,
+        company_id=target_company,
+        entity_type="ai_company_report",
+        entity_id=target_company,
+        meta={"ai_used": insights is not None},
+    )
+    await db.commit()
 
-    applications = list((await db.scalars(applications_stmt)).all())
-
-    company_data = {
-        "company_id": str(company_id) if company_id else "all",
-        "total_applications": len(applications),
-        "applications_by_status": {
-            status.value: len([a for a in applications if a.status == status])
-            for status in ApplicationStatus
-        },
-        "total_spent": sum(a.price for a in applications if a.status == ApplicationStatus.PAID),
-    }
-
-    # AI генерация отчёта
-    ai_report = await generate_company_report(company_data)
-
-    if ai_report:
-        return CompanyReportResponse(report=ai_report, fallback_used=False)
-
-    # Fallback: простая статистика
-    fallback_report = f"""Company Analytics Report
-
-Total Applications: {company_data['total_applications']}
-Total Spent: {company_data['total_spent']} UZS
-
-Applications by Status:
-"""
-    for status, count in company_data["applications_by_status"].items():
-        fallback_report += f"- {status}: {count}\n"
-
-    fallback_report += "\n(AI analysis unavailable)"
-
-    return CompanyReportResponse(report=fallback_report, fallback_used=True)
+    return CompanyReportResponse(
+        metrics=metrics,
+        insights=insights,
+        ai_used=insights is not None,
+    )

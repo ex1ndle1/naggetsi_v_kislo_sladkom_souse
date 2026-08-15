@@ -11,7 +11,7 @@
   * company_id benefit'а либо NULL (платформенная льгота), либо равен компании пользователя.
 """
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import Select, or_, select
@@ -35,7 +35,7 @@ def visible_benefits_query(
     Возвращает Select, чтобы вызывающий код мог добавить свои условия
     (категорию, поиск, пагинацию) до выполнения.
     """
-    moment = now or datetime.now(timezone.utc)
+    moment = now or datetime.now(UTC)
 
     return (
         select(Benefit)

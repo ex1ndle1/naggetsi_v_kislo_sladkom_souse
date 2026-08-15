@@ -10,7 +10,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from sqlalchemy import Enum as SAEnum, ForeignKey, String
+from sqlalchemy import Enum as SAEnum
+from sqlalchemy import ForeignKey, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -35,11 +36,11 @@ class AuditLog(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     company: Mapped[Company | None] = relationship()
 
-    action: Mapped[AuditAction] = mapped_column(
-        SAEnum(AuditAction, name="audit_action"), nullable=False, index=True
-    )
+    action: Mapped[AuditAction] = mapped_column(SAEnum(AuditAction, name="audit_action"), nullable=False, index=True)
     entity_type: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
-    entity_id: Mapped[UUID | None] = mapped_column(String(255), nullable=True, index=True)
+    # Строка, а не UUID: в журнал попадают и не-UUID идентификаторы (код промокода,
+    # email в инвайте), а сам журнал не должен ссылаться на живые строки.
+    entity_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
 
     # Конфликт с Base.metadata → маппим как meta, имя колонки остаётся metadata.
     meta: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)

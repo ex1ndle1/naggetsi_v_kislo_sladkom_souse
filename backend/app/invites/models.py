@@ -13,7 +13,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, String
+from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -30,14 +31,10 @@ class InviteToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # SHA-256 хеш токена: утечка БД не даёт возможности зарегистрироваться.
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
 
-    company_id: Mapped[UUID] = mapped_column(
-        ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True
-    )
+    company_id: Mapped[UUID] = mapped_column(ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True)
     company: Mapped[Company] = relationship(back_populates="invite_tokens")
 
-    plan: Mapped[UserPlan] = mapped_column(
-        SAEnum(UserPlan, name="user_plan"), nullable=False
-    )
+    plan: Mapped[UserPlan] = mapped_column(SAEnum(UserPlan, name="user_plan"), nullable=False)
 
     # Опционально фиксирует адрес: приглашение нельзя использовать с другим email.
     email: Mapped[str | None] = mapped_column(String(320), nullable=True, index=True)
@@ -56,9 +53,7 @@ class InviteToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     created_by: Mapped[User | None] = relationship(foreign_keys=[created_by_id])
 
-    used_by_id: Mapped[UUID | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
+    used_by_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     used_by: Mapped[User | None] = relationship(foreign_keys=[used_by_id])
 
     def is_expired(self, now: datetime) -> bool:

@@ -1,159 +1,128 @@
+import type { AxiosResponse } from 'axios'
 import axios from 'axios'
 
-const api = axios.create({
-  baseURL: '/api/v1',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-})
+export type Role = 'EMPLOYEE' | 'COMPANY_ADMIN' | 'MERCHANT' | 'PLATFORM_ADMIN'
+export type Plan = 'STANDARD' | 'PLUS' | 'PRO'
+export type BenefitCategory = 'SPORT' | 'EDUCATION' | 'HEALTH' | 'FOOD' | 'TRANSPORT' | 'ENTERTAINMENT' | 'TECH' | 'OTHER'
+export type PromoStatus = 'ISSUED' | 'REDEEMED' | 'EXPIRED' | 'REVOKED'
+export type RedemptionStatus = 'ISSUED' | 'REDEEMED' | 'EXPIRED' | 'CANCELLED'
 
-// Interceptor для добавления JWT токена
+export interface User {
+  id: string
+  email: string
+  first_name: string
+  last_name: string
+  role: Role
+  plan: Plan | null
+  is_active: boolean
+  company_id: string | null
+  merchant_id: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface Page<T> {
+  items: T[]
+  meta: { page: number; page_size: number; total: number; pages: number }
+}
+
+export interface PlanOffer { plan: Plan; discount_percent: number; is_available: boolean }
+export interface Benefit {
+  id: string; title: string; description: string; category: BenefitCategory
+  merchant_id: string; merchant_name?: string; destination_url: string | null
+  valid_until: string | null; your_discount_percent?: number
+  plan_offers: PlanOffer[]; already_redeemed?: boolean
+  max_redemptions_per_employee?: number; promo_valid_days?: number; redemptions_left?: number
+  is_active?: boolean; valid_from?: string | null; usage_limit?: number | null
+  created_at?: string; updated_at?: string
+}
+export interface PromoCode {
+  id: string; code: string; status: PromoStatus; issued_at: string; expires_at: string
+  redeemed_at: string | null; benefit_id: string; benefit_title: string; merchant_name: string
+  destination_url: string | null; discount_percent: number | null
+}
+export interface Redemption { id: string; status: RedemptionStatus; created_at: string; redeemed_at: string | null; benefit_id: string; benefit_title: string; benefit_category: BenefitCategory; merchant_name: string; promo_code: string | null; promo_status: PromoStatus | null; promo_expires_at: string | null }
+export interface Seat { plan: Plan; allocated: number; assigned: number; available: number; utilization_percent: number }
+export interface CompanyOverview { id: string; name: string; status: string; seats: { plans: Seat[]; total_allocated: number; total_assigned: number; total_available: number }; active_employees: number; created_at: string }
+export interface Employee { id: string; email: string; first_name: string; last_name: string; plan: Plan | null; is_active: boolean; redemptions: number; last_activity: string | null; created_at: string }
+export interface Invite { id: string; plan: Plan; email: string | null; status: string; expires_at: string; used_at: string | null; created_at: string }
+export interface Analytics { [key: string]: unknown }
+export interface RankedRow { label: string; value: number }
+export interface TrendPoint { day: string; count: number }
+
+const api = axios.create({ baseURL: '/api/v1', headers: { 'Content-Type': 'application/json' } })
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('access_token')
-  if (token) {
-    config.headers.Authorization = `Bearer ${token}`
-  }
+  if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
-
-// Interceptor для обработки 401 и refresh токена
-api.interceptors.response.use(
-  (response) => response,
-  async (error) => {
-    const originalRequest = error.config
-
-    if (error.response?.status === 401 && !originalRequest._retry) {
-      originalRequest._retry = true
-
-      try {
-        const refreshToken = localStorage.getItem('refresh_token')
-        const response = await axios.post('/api/v1/auth/refresh', {
-          refresh_token: refreshToken,
-        })
-
-        const { access_token, refresh_token } = response.data
-        localStorage.setItem('access_token', access_token)
-        localStorage.setItem('refresh_token', refresh_token)
-
-        originalRequest.headers.Authorization = `Bearer ${access_token}`
-        return api(originalRequest)
-      } catch (refreshError) {
-        localStorage.removeItem('access_token')
-        localStorage.removeItem('refresh_token')
-        window.location.href = '/login'
-        return Promise.reject(refreshError)
-      }
-    }
-
-    return Promise.reject(error)
+let refreshing: Promise<string> | null = null
+api.interceptors.response.use((response) => response, async (error) => {
+  const original = error.config
+  if (error.response?.status !== 401 || original?._retry || original?.url?.includes('/auth/')) return Promise.reject(error)
+  original._retry = true
+  try {
+    refreshing ??= api.post<{ access_token: string; refresh_token: string }>('/auth/refresh', { refresh_token: localStorage.getItem('refresh_token') }).then(({ data }) => {
+      localStorage.setItem('access_token', data.access_token); localStorage.setItem('refresh_token', data.refresh_token); return data.access_token
+    }).finally(() => { refreshing = null })
+    const token = await refreshing
+    original.headers.Authorization = `Bearer ${token}`
+    return api(original)
+  } catch (refreshError) {
+    localStorage.removeItem('access_token'); localStorage.removeItem('refresh_token'); localStorage.removeItem('user')
+    window.dispatchEvent(new Event('auth:logout'))
+    return Promise.reject(refreshError)
   }
-)
+})
 
-export default api
-
-// API methods
+const unwrap = <T>(request: Promise<AxiosResponse<T>>) => request
 export const authAPI = {
-  login: (email: string, password: string) =>
-    api.post('/auth/login', { email, password }),
-
-  register: (data: any) =>
-    api.post('/auth/register', data),
-
-  refresh: (refresh_token: string) =>
-    api.post('/auth/refresh', { refresh_token }),
+  login: (email: string, password: string) => api.post<{ access_token: string; refresh_token: string }>('/auth/login', { email, password }),
+  me: () => api.get<User>('/me'),
 }
-
 export const benefitsAPI = {
-  list: (params?: any) =>
-    api.get('/benefits', { params }),
-
-  getById: (id: string) =>
-    api.get(`/benefits/${id}`),
-
-  create: (data: any) =>
-    api.post('/benefits', data),
-
-  update: (id: string, data: any) =>
-    api.patch(`/benefits/${id}`, data),
+  list: (params?: { page?: number; page_size?: number; category?: BenefitCategory }) => unwrap(api.get<Page<Benefit>>('/benefits', { params })),
+  detail: (id: string) => api.get<Benefit>(`/benefits/${id}`),
+  redeem: (id: string) => api.post<{ redemption_id: string; promo_code: string; expires_at: string; status: RedemptionStatus; message: string }>(`/benefits/${id}/redeem`),
 }
-
-export const applicationsAPI = {
-  list: (params?: any) =>
-    api.get('/applications', { params }),
-
-  getById: (id: string) =>
-    api.get(`/applications/${id}`),
-
-  create: (benefit_id: string) =>
-    api.post('/applications', { benefit_id }),
-
-  updateStatus: (id: string, status: string, reason?: string) =>
-    api.patch(`/applications/${id}/status`, { status, reason }),
+export const meAPI = {
+  promoCodes: (params?: { page?: number; page_size?: number; status?: PromoStatus }) => api.get<Page<PromoCode>>('/me/promo-codes', { params }),
+  redemptions: (params?: { page?: number; page_size?: number }) => api.get<Page<Redemption>>('/me/redemptions', { params }),
 }
-
-export const paymentsAPI = {
-  initiate: (application_id: string, provider: string = 'CLICK') =>
-    api.post('/payments/initiate', { application_id, provider }),
+export const companyAPI = {
+  overview: () => api.get<CompanyOverview>('/company'),
+  employees: (params?: { page?: number; page_size?: number; plan?: Plan; is_active?: boolean }) => api.get<Page<Employee>>('/company/employees', { params }),
+  invites: (params?: { page?: number; page_size?: number; status?: string }) => api.get<Page<Invite>>('/company/invites', { params }),
+  createInvite: (data: { plan: Plan; email?: string; expires_in_days?: number }) => api.post<{ token: string; plan: Plan; email: string | null; expires_at: string }>('/company/invites', data),
+  changePlan: (id: string, plan: Plan) => api.post<Employee>(`/company/employees/${id}/plan`, { plan }),
+  toggleEmployee: (id: string, active: boolean) => api.post<Employee>(`/company/employees/${id}/${active ? 'activate' : 'deactivate'}`),
+  analytics: () => api.get<Analytics>('/company/analytics'),
 }
-
+export const merchantAPI = {
+  benefits: (params?: { merchant_id?: string }) => api.get<Benefit[]>('/merchant/benefits', { params }),
+  createBenefit: (data: Record<string, unknown>) => api.post<Benefit>('/merchant/benefits', data),
+  updateBenefit: (id: string, data: Record<string, unknown>) => api.patch<Benefit>(`/merchant/benefits/${id}`, data),
+  analytics: () => api.get<Analytics>('/merchant/analytics'),
+  lookupPromo: (code: string) => api.get(`/merchant/promo-codes/${encodeURIComponent(code)}`),
+  redeemPromo: (code: string) => api.post(`/merchant/promo-codes/${encodeURIComponent(code)}/redeem`),
+}
+export const adminAPI = {
+  users: (params?: { page?: number; page_size?: number }) => api.get<Page<User>>('/admin/users', { params }),
+  benefits: (params?: { page?: number; page_size?: number }) => api.get<Page<Benefit>>('/admin/benefits', { params }),
+  redemptions: (params?: { page?: number; page_size?: number }) => api.get('/admin/redemptions', { params }),
+  auditLogs: (params?: { page?: number; page_size?: number }) => api.get('/admin/audit-logs', { params }),
+  setUserActive: (id: string, active: boolean) => api.patch<User>(`/admin/users/${id}/${active ? 'unblock' : 'block'}`),
+}
 export const aiAPI = {
-  getRecommendations: () =>
-    api.get('/ai/recommendations'),
-
-  checkFraud: (application_id: string) =>
-    api.post('/ai/fraud-check', { application_id }),
-
-  getCompanyReport: () =>
-    api.get('/ai/company-report'),
+  concierge: (query: string) => api.post<{ benefits: Benefit[]; reasoning: string | null; ai_used: boolean }>('/ai/concierge', { query }),
+  merchantDraft: (hint: string) => api.post('/ai/merchant/generate-offer', { hint }),
+  companyReport: (companyId?: string) => api.get<{ metrics: Analytics; insights: string | null; ai_used: boolean }>('/ai/company-report', { params: companyId ? { company_id: companyId } : undefined }),
 }
-
-export const companiesAPI = {
-  list: (params?: any) =>
-    api.get('/companies', { params }),
-
-  getById: (id: string) =>
-    api.get(`/companies/${id}`),
-
-  create: (data: any) =>
-    api.post('/companies', data),
-
-  update: (id: string, data: any) =>
-    api.patch(`/companies/${id}`, data),
-
-  delete: (id: string) =>
-    api.delete(`/companies/${id}`),
+export async function issueEventTicket() { return (await api.post<{ ticket: string; expires_in_seconds: number }>('/events/ticket')).data }
+export async function subscribeToEvents(onEvent: (event: MessageEvent) => void, onError?: () => void) {
+  const { ticket } = await issueEventTicket()
+  const source = new EventSource(`/api/v1/events/stream?ticket=${encodeURIComponent(ticket)}`)
+  source.onmessage = onEvent; source.onerror = () => onError?.()
+  return source
 }
-
-export const merchantsAPI = {
-  list: (params?: any) =>
-    api.get('/merchants', { params }),
-
-  getById: (id: string) =>
-    api.get(`/merchants/${id}`),
-
-  create: (data: any) =>
-    api.post('/merchants', data),
-
-  update: (id: string, data: any) =>
-    api.patch(`/merchants/${id}`, data),
-
-  delete: (id: string) =>
-    api.delete(`/merchants/${id}`),
-}
-
-// SSE для real-time событий
-export function subscribeToEvents(onMessage: (event: MessageEvent) => void) {
-  const token = localStorage.getItem('access_token')
-  if (!token) return null
-
-  const eventSource = new EventSource(`/api/v1/events/stream`, {
-    withCredentials: true,
-  })
-
-  eventSource.onmessage = onMessage
-  eventSource.onerror = (error) => {
-    console.error('SSE error:', error)
-  }
-
-  return eventSource
-}
+export default api

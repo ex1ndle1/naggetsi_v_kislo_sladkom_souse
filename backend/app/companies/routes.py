@@ -41,7 +41,7 @@ async def list_companies(
     # Пагинация
     stmt = stmt.offset((page - 1) * page_size).limit(page_size).order_by(Company.created_at.desc())
     result = await db.scalars(stmt)
-    items = list(result.all())
+    items = [CompanyResponse.model_validate(company) for company in result.all()]
 
     return CompanyListResponse(
         items=items,

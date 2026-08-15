@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/api/client.ts","./src/context/AuthContext.tsx","./src/pages/CompanyAdminDashboard.tsx","./src/pages/EmployeeDashboard.tsx","./src/pages/Landing.tsx","./src/pages/Login.tsx","./src/pages/MerchantDashboard.tsx","./src/pages/PlatformAdminDashboard.tsx"],"version":"5.7.2"}

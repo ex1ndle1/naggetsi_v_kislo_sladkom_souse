@@ -1,5 +1,6 @@
-"""Seeds package для демо-данных."""
+"""Seeds package для демо-данных.
 
-from app.seeds.demo import seed_demo_data
-
-__all__ = ["seed_demo_data"]
+Без re-export из app.seeds.demo: модуль запускается как `python -m app.seeds.demo`,
+и импорт здесь заставил бы интерпретатор загрузить его дважды (RuntimeWarning про
+'found in sys.modules after import of package').
+"""

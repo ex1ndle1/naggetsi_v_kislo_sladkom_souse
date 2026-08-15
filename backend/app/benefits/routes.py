@@ -1,31 +1,38 @@
-"""Роуты каталога льгот (NEXUS30 §35).
+"""Каталог льгот для сотрудника (NEXUS30 §28, §35).
 
-Employee: список отфильтрован по плану (visibility.py), redeem benefit.
-Merchant: CRUD своих льгот.
+Видимость определяет ``visible_benefits_query`` — один запрос и для списка, и для
+детали, и для выдачи кода. Если бы detail-эндпоинт фильтровал иначе, сотрудник
+STANDARD добрался бы до PRO-льготы по прямой ссылке.
+
+CRUD мерчанта живёт в ``app/merchants/benefit_routes.py`` под собственным префиксом:
+внутри этого роутера любой фиксированный путь после ``/{benefit_id}`` трактовался бы
+как UUID и был бы недостижим.
 """
 
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.benefits.models import Benefit
-from app.benefits.plan_offers import BenefitPlanOffer
 from app.benefits.schemas import (
-    BenefitCreateRequest,
     BenefitDetailResponse,
     BenefitListItem,
-    BenefitUpdateRequest,
-    MerchantBenefitResponse,
-    PlanOfferInput,
     PlanOfferResponse,
+    RedeemResponse,
 )
 from app.benefits.visibility import discount_for_plan, visible_benefits_query
-from app.core.deps import CurrentUser, DbSession, require_roles
-from app.core.enums import BenefitCategory, RedemptionStatus, UserRole
-from app.core.errors import Forbidden, NotFound
+from app.core.config import settings
+from app.core.deps import AuthUser, DbSession, require_roles
+from app.core.enums import BenefitCategory, RedemptionStatus, UserPlan, UserRole
+from app.core.errors import BadRequest, NotFound
 from app.core.pagination import Page, PageParams, paginate
+from app.core.rate_limit import rate_limit
+from app.events.publisher import publish_promo_issued
 from app.redemptions.models import BenefitRedemption
 from app.redemptions.service import redeem_benefit
 
@@ -33,39 +40,60 @@ router = APIRouter(prefix="/benefits", tags=["benefits"])
 
 __all__ = ["router"]
 
+EmployeeUser = Annotated[AuthUser, Depends(require_roles(UserRole.EMPLOYEE))]
 
-# === Employee endpoints ===
+_COUNTED_STATUSES = (RedemptionStatus.ISSUED, RedemptionStatus.REDEEMED)
 
 
-@router.get("", response_model=Page[BenefitListItem])
+def _require_employee_scope(user: AuthUser) -> tuple[UUID, UserPlan]:
+    """Убедиться, что у сотрудника есть компания и тариф.
+
+    Сотрудник без тарифа — следствие незавершённой выдачи места; каталог для него
+    не определён, поэтому это ошибка данных, а не пустой список.
+    """
+    if not user.company_id or not user.plan:
+        raise BadRequest(message="Employee must be assigned to a company and a plan")
+    return user.company_id, user.plan
+
+
+@router.get(
+    "",
+    response_model=Page[BenefitListItem],
+    dependencies=[Depends(rate_limit("benefits", settings.rate_limit_benefits))],
+)
 async def list_benefits(
     db: DbSession,
-    user: CurrentUser,
-    pagination: PageParams = Depends(),
-    category: BenefitCategory | None = Query(default=None),
+    user: EmployeeUser,
+    pagination: Annotated[PageParams, Depends()],
+    category: Annotated[BenefitCategory | None, Query()] = None,
 ) -> Page[BenefitListItem]:
-    """Каталог льгот, отфильтрованный по плану пользователя (NEXUS30 §8, §28)."""
-    if not user.company_id or not user.plan:
-        raise Forbidden(message="Only employees with a plan can browse benefits")
+    """Каталог, отфильтрованный по тарифу сотрудника (NEXUS30 §8, §28)."""
+    company_id, plan = _require_employee_scope(user)
 
-    stmt = visible_benefits_query(user.plan, user.company_id)
+    stmt = visible_benefits_query(plan, company_id).order_by(Benefit.title)
     if category:
         stmt = stmt.where(Benefit.category == category)
 
     page = await paginate(db, stmt, pagination)
 
-    # Enrichment: подгрузка "already_redeemed" для каждой льготы.
-    benefit_ids = [b.id for b in page.items]
-    redeemed_stmt = select(BenefitRedemption.benefit_id).where(
-        BenefitRedemption.employee_id == user.user_id,
-        BenefitRedemption.benefit_id.in_(benefit_ids),
-        BenefitRedemption.status.in_([RedemptionStatus.ISSUED, RedemptionStatus.REDEEMED]),
-    )
-    redeemed_ids = set((await db.scalars(redeemed_stmt)).all())
+    benefit_ids = [benefit.id for benefit in page.items]
+    redeemed_ids: set[UUID] = set()
+    if benefit_ids:
+        redeemed_ids = set(
+            (
+                await db.scalars(
+                    select(BenefitRedemption.benefit_id).where(
+                        BenefitRedemption.employee_id == user.user_id,
+                        BenefitRedemption.benefit_id.in_(benefit_ids),
+                        BenefitRedemption.status.in_(_COUNTED_STATUSES),
+                    )
+                )
+            ).all()
+        )
 
-    items = []
+    items: list[BenefitListItem] = []
     for benefit in page.items:
-        offer = discount_for_plan(benefit, user.plan)
+        offer = discount_for_plan(benefit, plan)
         items.append(
             BenefitListItem(
                 id=benefit.id,
@@ -73,16 +101,18 @@ async def list_benefits(
                 description=benefit.description,
                 category=benefit.category,
                 merchant_id=benefit.merchant_id,
-                merchant_name=benefit.merchant.name if benefit.merchant else "",
+                merchant_name=benefit.merchant.name,
                 destination_url=benefit.destination_url,
                 valid_until=benefit.valid_until,
-                your_discount_percent=offer.discount_percent if offer else 0,
+                your_discount_percent=offer.discount_percent if offer else Decimal(0),
+                # Только доступные сотруднику уровни: перечислять чужие тарифы
+                # означало бы показывать, какая скидка есть у коллег.
                 plan_offers=[
                     PlanOfferResponse.model_validate(o)
                     for o in benefit.plan_offers
-                    if o.is_available
+                    if o.is_available and o.plan == plan
                 ],
-                already_redeemed=(benefit.id in redeemed_ids),
+                already_redeemed=benefit.id in redeemed_ids,
             )
         )
 
@@ -93,27 +123,25 @@ async def list_benefits(
 async def get_benefit_detail(
     benefit_id: UUID,
     db: DbSession,
-    user: CurrentUser,
+    user: EmployeeUser,
 ) -> BenefitDetailResponse:
-    """Детали льготы (NEXUS30 §28)."""
-    if not user.company_id or not user.plan:
-        raise Forbidden(message="Only employees with a plan can view benefits")
+    """Детали льготы. Недоступная тарифу льгота отвечает 404, а не 403."""
+    company_id, plan = _require_employee_scope(user)
 
-    stmt = visible_benefits_query(user.plan, user.company_id).where(Benefit.id == benefit_id)
-    benefit = await db.scalar(stmt)
+    benefit = await db.scalar(visible_benefits_query(plan, company_id).where(Benefit.id == benefit_id))
+    if benefit is None:
+        raise NotFound(message="Benefit not found")
 
-    if not benefit:
-        raise NotFound(message="Benefit not found or not available for your plan")
-
-    offer = discount_for_plan(benefit, user.plan)
-    count = await db.scalar(
-        select(func.count(BenefitRedemption.id)).where(
-            BenefitRedemption.employee_id == user.user_id,
-            BenefitRedemption.benefit_id == benefit_id,
-            BenefitRedemption.status.in_([RedemptionStatus.ISSUED, RedemptionStatus.REDEEMED]),
+    offer = discount_for_plan(benefit, plan)
+    used = (
+        await db.scalar(
+            select(func.count(BenefitRedemption.id)).where(
+                BenefitRedemption.employee_id == user.user_id,
+                BenefitRedemption.benefit_id == benefit_id,
+                BenefitRedemption.status.in_(_COUNTED_STATUSES),
+            )
         )
-    )
-    already_redeemed = count > 0
+    ) or 0
 
     return BenefitDetailResponse(
         id=benefit.id,
@@ -121,57 +149,59 @@ async def get_benefit_detail(
         description=benefit.description,
         category=benefit.category,
         merchant_id=benefit.merchant_id,
-        merchant_name=benefit.merchant.name if benefit.merchant else "",
+        merchant_name=benefit.merchant.name,
         destination_url=benefit.destination_url,
         valid_until=benefit.valid_until,
-        your_discount_percent=offer.discount_percent if offer else 0,
+        your_discount_percent=offer.discount_percent if offer else Decimal(0),
         plan_offers=[
-            PlanOfferResponse.model_validate(o) for o in benefit.plan_offers if o.is_available
+            PlanOfferResponse.model_validate(o) for o in benefit.plan_offers if o.is_available and o.plan == plan
         ],
-        already_redeemed=already_redeemed,
+        already_redeemed=used > 0,
         max_redemptions_per_employee=benefit.max_redemptions_per_employee,
         promo_valid_days=benefit.promo_valid_days,
-        redemptions_left=benefit.max_redemptions_per_employee - count,
+        redemptions_left=max(0, benefit.max_redemptions_per_employee - used),
     )
 
 
-@router.post("/{benefit_id}/redeem", response_model=dict)
-async def redeem_benefit_endpoint(
+@router.post(
+    "/{benefit_id}/redeem",
+    response_model=RedeemResponse,
+    # Выдача кода — самая дорогая операция каталога и главная цель
+    # злоупотреблений: лимит здесь строже, чем на чтение.
+    dependencies=[Depends(rate_limit("redemptions", settings.rate_limit_redemptions))],
+)
+async def redeem(
     benefit_id: UUID,
     db: DbSession,
-    user: CurrentUser,
-) -> dict:
-    """Получить promo code для льготы (NEXUS30 §11, §14)."""
-    if not user.company_id or not user.plan:
-        raise Forbidden(message="Only employees with a plan can redeem benefits")
+    user: EmployeeUser,
+) -> RedeemResponse:
+    """Получить промокод на льготу (NEXUS30 §11, §14).
 
-    redemption, promo_code = await redeem_benefit(
+    Все проверки §14 выполняет ``redeem_benefit``. Событие публикуется после коммита:
+    иначе подписчик мог бы получить уведомление о коде, вставка которого откатилась.
+    """
+    company_id, plan = _require_employee_scope(user)
+
+    redemption, promo = await redeem_benefit(
         db=db,
         benefit_id=benefit_id,
         employee_id=user.user_id,
-        company_id=user.company_id,
-        plan=user.plan,
+        company_id=company_id,
+        plan=plan,
     )
     await db.commit()
 
-    return {
-        "redemption_id": str(redemption.id),
-        "promo_code": promo_code,
-        "expires_at": redemption.promo_code[0].expires_at.isoformat()
-        if redemption.promo_code
-        else None,
-        "message": "Promo code issued successfully. Use it at the merchant's website.",
-    }
+    await publish_promo_issued(
+        user_id=user.user_id,
+        promo_code=promo.code,
+        benefit_id=benefit_id,
+        expires_at=promo.expires_at,
+    )
 
-
-# === Merchant endpoints (placeholder) ===
-
-
-@router.post("/merchant/benefits", response_model=MerchantBenefitResponse)
-async def create_merchant_benefit(
-    payload: BenefitCreateRequest,
-    db: DbSession,
-    user: CurrentUser = Depends(require_roles(UserRole.MERCHANT, UserRole.PLATFORM_ADMIN)),
-) -> MerchantBenefitResponse:
-    """Создать льготу (NEXUS30 §30). Stub для следующей стадии."""
-    raise NotImplementedError("Merchant benefit creation will be implemented in next stage")
+    return RedeemResponse(
+        redemption_id=redemption.id,
+        promo_code=promo.code,
+        expires_at=promo.expires_at,
+        status=redemption.status,
+        message="Promo code issued. Use it on the merchant's website.",
+    )

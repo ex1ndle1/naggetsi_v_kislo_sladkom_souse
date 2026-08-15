@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Generic, TypeVar
-
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-T = TypeVar("T")
+__all__ = ["Page", "PageMeta", "PageParams", "build_page", "paginate"]
 
 
 class PageParams(BaseModel):
@@ -29,14 +27,35 @@ class PageMeta(BaseModel):
     has_prev: bool
 
 
-class Page(BaseModel, Generic[T]):
+class Page[T](BaseModel):
     """Страница результатов с метаданными."""
 
     items: list[T]
     meta: PageMeta
 
 
-async def paginate(
+def build_page[T](items: list[T], params: PageParams, total_items: int) -> Page[T]:
+    """Обернуть готовый список в Page.
+
+    Нужно там, где ответ собирается из связей вручную (история промокодов,
+    аналитика) и `paginate` неприменим: метаданные страницы должны считаться в
+    одном месте, иначе `has_next` будет вычисляться по-разному в разных роутерах.
+    """
+    total_pages = (total_items + params.page_size - 1) // params.page_size if total_items else 0
+    return Page(
+        items=items,
+        meta=PageMeta(
+            page=params.page,
+            page_size=params.page_size,
+            total_items=total_items,
+            total_pages=total_pages,
+            has_next=params.page < total_pages,
+            has_prev=params.page > 1,
+        ),
+    )
+
+
+async def paginate[T](
     session: AsyncSession,
     stmt: Select[tuple[T]],
     params: PageParams,
@@ -60,13 +79,4 @@ async def paginate(
     result = await session.execute(stmt.limit(params.page_size).offset(offset))
     items = list(result.scalars().all())
 
-    total_pages = (total_items + params.page_size - 1) // params.page_size if total_items else 0
-    meta = PageMeta(
-        page=params.page,
-        page_size=params.page_size,
-        total_items=total_items,
-        total_pages=total_pages,
-        has_next=params.page < total_pages,
-        has_prev=params.page > 1,
-    )
-    return Page(items=items, meta=meta)
+    return build_page(items, params, total_items)

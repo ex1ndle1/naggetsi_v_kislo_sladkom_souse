@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { AuthProvider, useAuth } from './context/AuthContext'
+import Landing from './pages/Landing'
 import Login from './pages/Login'
 import EmployeeDashboard from './pages/EmployeeDashboard'
 import CompanyAdminDashboard from './pages/CompanyAdminDashboard'
@@ -8,7 +9,8 @@ import MerchantDashboard from './pages/MerchantDashboard'
 import PlatformAdminDashboard from './pages/PlatformAdminDashboard'
 
 function PrivateRoute({ children }: { children: ReactNode }) {
-  const { user } = useAuth()
+  const { user, loading } = useAuth()
+  if (loading) return null
   return user ? <>{children}</> : <Navigate to="/login" />
 }
 
@@ -45,7 +47,7 @@ function App() {
               </PrivateRoute>
             }
           />
-          <Route path="/" element={<Navigate to="/dashboard" />} />
+          <Route path="/" element={<Landing />} />
         </Routes>
       </BrowserRouter>
     </AuthProvider>
