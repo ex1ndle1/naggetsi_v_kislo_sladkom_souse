@@ -17,6 +17,12 @@ export default function CompanyAdminDashboard() {
   const [inviteForm, setInviteForm] = useState({ plan: 'STANDARD' as Plan, email: '', expires_in_days: 7 })
   const [newToken, setNewToken] = useState('')
 
+  // Bitrix24 sync state
+  const [showBitrixForm, setShowBitrixForm] = useState(false)
+  const [bitrixWebhook, setBitrixWebhook] = useState('')
+  const [bitrixResult, setBitrixResult] = useState<string | null>(null)
+  const [bitrixLoading, setBitrixLoading] = useState(false)
+
   const load = async () => {
     setLoading(true)
     try {
@@ -43,6 +49,27 @@ export default function CompanyAdminDashboard() {
     if (report) return setTab('report')
     const { data } = await aiAPI.companyReport()
     setReport(data); setTab('report')
+  }
+
+  const syncBitrix = async (e: FormEvent) => {
+    e.preventDefault()
+    if (!bitrixWebhook.trim()) return
+
+    setBitrixLoading(true)
+    setBitrixResult(null)
+
+    try {
+      const { data } = await companyAPI.syncBitrix(bitrixWebhook.trim())
+      setBitrixResult(
+        `✅ Импорт завершён:\n• Получено из Bitrix24: ${data.total_fetched}\n• Создано новых: ${data.created}\n• Обновлено: ${data.updated}`
+      )
+      await load()
+      setBitrixWebhook('')
+    } catch (err: any) {
+      setBitrixResult(`❌ Ошибка: ${err.response?.data?.error?.message || 'Не удалось выполнить синхронизацию'}`)
+    } finally {
+      setBitrixLoading(false)
+    }
   }
 
   const ov = overview
@@ -226,23 +253,100 @@ export default function CompanyAdminDashboard() {
 
       {tab === 'employees' && (
         <section>
-          {employees.map((emp) => (
-            <div className="list-row" key={emp.id}>
+          {/* Панель синхронизации Bitrix24 */}
+          <div className="panel" style={{ marginBottom: '1.5rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <div>
-                <strong>{emp.first_name} {emp.last_name}</strong>
-                <p className="muted">{emp.email} · {emp.plan ?? '—'} · {emp.redemptions} использований</p>
+                <p className="eyebrow">Bitrix24</p>
+                <h2>Импорт сотрудников</h2>
               </div>
-              <div className="row-actions">
-                <span className={`status ${emp.is_active ? 'issued' : 'expired'}`}>{emp.is_active ? 'ACTIVE' : 'INACTIVE'}</span>
-                <button className="button secondary small" onClick={() => void companyAPI.toggleEmployee(emp.id, !emp.is_active).then(load)}>
-                  {emp.is_active ? 'Откл.' : 'Вкл.'}
-                </button>
-                {emp.plan && plans.filter((p) => p !== emp.plan).map((p) => (
-                  <button className="button secondary small" key={p} onClick={() => void companyAPI.changePlan(emp.id, p).then(load)}>{p}</button>
-                ))}
-              </div>
+              <button
+                className="button secondary"
+                onClick={() => setShowBitrixForm(!showBitrixForm)}
+              >
+                {showBitrixForm ? 'Скрыть' : 'Синхронизация с Bitrix24'}
+              </button>
             </div>
-          ))}
+
+            {showBitrixForm && (
+              <>
+                <p className="muted" style={{ marginBottom: '1rem' }}>
+                  Введите входящий webhook URL из вашего Bitrix24 портала.
+                  Формат: <code>https://your-portal.bitrix24.ru/rest/1/xxxxx/</code>
+                </p>
+
+                <form onSubmit={syncBitrix} style={{ marginBottom: '1rem' }}>
+                  <div className="inline-form">
+                    <input
+                      type="url"
+                      placeholder="https://your-portal.bitrix24.ru/rest/1/xxxxx/"
+                      value={bitrixWebhook}
+                      onChange={(e) => setBitrixWebhook(e.target.value)}
+                      required
+                      disabled={bitrixLoading}
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="submit"
+                      className="button"
+                      disabled={bitrixLoading || !bitrixWebhook.trim()}
+                    >
+                      {bitrixLoading ? 'Импорт...' : 'Импортировать'}
+                    </button>
+                  </div>
+                </form>
+
+                {bitrixResult && (
+                  <div
+                    className="notice"
+                    style={{
+                      whiteSpace: 'pre-line',
+                      background: bitrixResult.startsWith('✅') ? 'var(--accent-soft)' : '#fef2f2',
+                      borderLeft: bitrixResult.startsWith('✅') ? '3px solid var(--accent)' : '3px solid #ef4444'
+                    }}
+                  >
+                    {bitrixResult}
+                  </div>
+                )}
+
+                <details style={{ marginTop: '1rem', fontSize: '.85rem', color: 'var(--muted)' }}>
+                  <summary style={{ cursor: 'pointer', fontWeight: 600 }}>Как получить webhook?</summary>
+                  <ol style={{ paddingLeft: '1.5rem', marginTop: '.5rem', lineHeight: 1.6 }}>
+                    <li>Зайдите в Bitrix24: <strong>Приложения</strong> → <strong>Webhook</strong> → <strong>Входящий webhook</strong></li>
+                    <li>Выберите права: <strong>user</strong> (чтение пользователей)</li>
+                    <li>Скопируйте URL вида <code>https://ваш-портал.bitrix24.ru/rest/1/код/</code></li>
+                    <li>Вставьте его выше и нажмите «Импортировать»</li>
+                  </ol>
+                </details>
+              </>
+            )}
+          </div>
+
+          {/* Существующий список сотрудников */}
+          <div className="panel">
+            <h2 style={{ marginBottom: '1rem' }}>Список сотрудников ({employees.length})</h2>
+            {employees.length === 0 ? (
+              <p className="muted">Пока нет сотрудников. Создайте приглашения или импортируйте из Bitrix24.</p>
+            ) : (
+              employees.map((emp) => (
+                <div className="list-row" key={emp.id}>
+                  <div>
+                    <strong>{emp.first_name} {emp.last_name}</strong>
+                    <p className="muted">{emp.email} · {emp.plan ?? '—'} · {emp.redemptions} использований</p>
+                  </div>
+                  <div className="row-actions">
+                    <span className={`status ${emp.is_active ? 'issued' : 'expired'}`}>{emp.is_active ? 'ACTIVE' : 'INACTIVE'}</span>
+                    <button className="button secondary small" onClick={() => void companyAPI.toggleEmployee(emp.id, !emp.is_active).then(load)}>
+                      {emp.is_active ? 'Откл.' : 'Вкл.'}
+                    </button>
+                    {emp.plan && plans.filter((p) => p !== emp.plan).map((p) => (
+                      <button className="button secondary small" key={p} onClick={() => void companyAPI.changePlan(emp.id, p).then(load)}>{p}</button>
+                    ))}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
         </section>
       )}
 

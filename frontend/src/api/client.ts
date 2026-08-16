@@ -97,6 +97,13 @@ export const companyAPI = {
   changePlan: (id: string, plan: Plan) => api.post<Employee>(`/company/employees/${id}/plan`, { plan }),
   toggleEmployee: (id: string, active: boolean) => api.post<Employee>(`/company/employees/${id}/${active ? 'activate' : 'deactivate'}`),
   analytics: () => api.get<Analytics>('/company/analytics'),
+  syncBitrix: (webhookUrl: string) => api.post<{
+    company_id: string
+    webhook_url: string
+    total_fetched: number
+    created: number
+    updated: number
+  }>('/companies/bitrix/sync', { webhook_url: webhookUrl }),
 }
 export const merchantAPI = {
   benefits: (params?: { merchant_id?: string }) => api.get<Benefit[]>('/merchant/benefits', { params }),
