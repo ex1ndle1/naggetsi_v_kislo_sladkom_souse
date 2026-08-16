@@ -1,9 +1,15 @@
 FROM nginx:1.27-alpine
 
 RUN rm /etc/nginx/conf.d/default.conf
+
+# Copy both dev and prod configs
 COPY nginx.conf /etc/nginx/nginx.conf
+COPY nginx.prod.conf /etc/nginx/nginx.prod.conf
 
-EXPOSE 80
+# Create SSL directory
+RUN mkdir -p /etc/nginx/ssl
 
-HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
-    CMD wget -qO- http://127.0.0.1/healthz >/dev/null || exit 1
+EXPOSE 80 443
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD wget -qO- http://127.0.0.1/health >/dev/null || exit 1

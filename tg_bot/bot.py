@@ -1,11 +1,12 @@
 """Telegram-бот для проверки промокодов Наггетсы30.
 
 Команды:
-  /start       — приветствие и инструкция
-  /check CODE  — проверить промокод по коду
-  Любое сообщение из одного слова ≤ 20 символов воспринимается как код.
+  /start         — приветствие и инструкция
+  /check CODE    — проверить промокод по коду
+  /activate CODE — погасить промокод
+  Любое сообщение из одного слова ≤ 20 символов воспринимается как код для проверки.
 
-Бот только проверяет статус. Погашение остаётся за мерчантом в веб-кабинете.
+Бот может проверять статус и погашать промокоды. Альтернатива — погашение через веб-кабинет мерчанта.
 """
 
 from __future__ import annotations
@@ -127,15 +128,46 @@ def is_bare_code(text: str) -> bool:
     return bool(text) and " " not in text.strip() and len(text.strip()) <= 24
 
 
+async def redeem_code(code: str) -> str:
+    """Погашает промокод через /api/v1/bot/promo/{code}/redeem."""
+    url = f"{BACKEND_URL}/api/v1/bot/promo/{code.upper().strip()}/redeem"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers=_HEADERS)
+    except httpx.RequestError as exc:
+        log.error("backend unreachable: %s", exc)
+        return "⚠️ Не удалось связаться с сервером. Попробуйте позже."
+
+    if resp.status_code == 404:
+        return f"❌ Промокод <b>{code.upper()}</b> не найден."
+
+    if resp.status_code == 403:
+        log.error("bot api key rejected or not configured")
+        return "⚠️ Бот не настроен. Обратитесь к администратору."
+
+    if resp.status_code == 400:
+        # Код уже погашен, истёк или отозван
+        return f"⚠️ Промокод <b>{code.upper()}</b> уже погашен, истёк или недоступен."
+
+    if resp.status_code != 200:
+        log.error("unexpected status %s from backend", resp.status_code)
+        return "⚠️ Ошибка при погашении кода. Попробуйте позже."
+
+    data = resp.json()
+    message = data.get("message", f"Промокод {code.upper()} погашен!")
+    return f"✅ {message}"
+
+
 # ── Хендлеры ────────────────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message) -> None:
     await message.answer(
-        "👋 Привет! Я бот для проверки промокодов <b>Наггетсы30</b>.\n\n"
-        "Чтобы проверить промокод, отправь:\n"
-        "<code>/check ABCDEF-1234</code>\n\n"
-        "Или просто напиши код сообщением.",
+        "👋 Привет! Я бот для проверки и активации промокодов <b>Наггетсы30</b>.\n\n"
+        "Команды:\n"
+        "<code>/check CODE</code> — проверить статус промокода\n"
+        "<code>/activate CODE</code> — погасить промокод\n\n"
+        "Или просто напиши код сообщением для проверки.",
         parse_mode="HTML",
     )
 
@@ -153,6 +185,22 @@ async def cmd_check(message: types.Message) -> None:
         return
     code = parts[1].strip()
     await message.answer(await lookup_code(code), parse_mode="HTML")
+
+
+@dp.message(Command("activate"))
+async def cmd_activate(message: types.Message) -> None:
+    """Погасить промокод одной командой: /activate CODE"""
+    if not message.text:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.answer(
+            "❓ Укажи код после команды:\n<code>/activate ABCDEF-1234</code>",
+            parse_mode="HTML",
+        )
+        return
+    code = parts[1].strip()
+    await message.answer(await redeem_code(code), parse_mode="HTML")
 
 
 @dp.message()

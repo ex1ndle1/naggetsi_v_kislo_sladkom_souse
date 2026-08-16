@@ -14,6 +14,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
+from sqlalchemy import distinct, select
+
 from app.ai.service import (
     ConciergeResult,
     MerchantDraft,
@@ -23,6 +25,7 @@ from app.ai.service import (
 )
 from app.analytics.service import company_analytics
 from app.audit.service import record_audit
+from app.benefits.models import Benefit
 from app.benefits.visibility import discount_for_plan, visible_benefits_query
 from app.core.config import settings
 from app.core.deps import AuthUser, DbSession, require_roles
@@ -30,6 +33,7 @@ from app.core.enums import AuditAction, UserRole
 from app.core.errors import BadRequest
 from app.core.rate_limit import rate_limit
 from app.merchants.models import Merchant
+from app.redemptions.models import BenefitRedemption
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -95,6 +99,14 @@ async def concierge(
     stmt = visible_benefits_query(user.plan, user.company_id).limit(_CONCIERGE_CATALOG_LIMIT)
     benefits = list((await db.scalars(stmt)).unique().all())
 
+    # Собрать историю использованных категорий
+    used_categories_stmt = (
+        select(distinct(Benefit.category))
+        .join(BenefitRedemption, BenefitRedemption.benefit_id == Benefit.id)
+        .where(BenefitRedemption.employee_id == user.user_id)
+    )
+    used_categories = [cat.value for cat in await db.scalars(used_categories_stmt)]
+
     catalog: list[dict[str, object]] = []
     by_id = {}
     for benefit in benefits:
@@ -116,7 +128,10 @@ async def concierge(
     result: ConciergeResult = await rank_benefits_for_employee(
         query=payload.query,
         eligible=catalog,
-        employee_context={"plan": user.plan.value},
+        employee_context={
+            "plan": user.plan.value,
+            "previously_used_categories": used_categories,
+        },
     )
 
     record_audit(

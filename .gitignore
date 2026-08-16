@@ -56,3 +56,6 @@ frontend/build/
 # Docker volumes
 pgdata/
 redisdata/
+
+nginx/ssl/*.pem
+nginx/ssl/*.key

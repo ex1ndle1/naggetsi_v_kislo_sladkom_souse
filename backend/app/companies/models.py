@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Enum as SAEnum
+from sqlalchemy import Boolean, Enum as SAEnum
 from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,6 +26,10 @@ class Company(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
         default=CompanyStatus.ACTIVE,
     )
+
+    # Bitrix24 integration
+    bitrix_webhook_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    bitrix_sync_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     users: Mapped[list[User]] = relationship(back_populates="company")
     plan_allocations: Mapped[list[PlanAllocation]] = relationship(

@@ -1,4 +1,6 @@
-# NEXUS30 — Corporate Benefits Platform
+# Наггетсы30 — Corporate Benefits Platform
+
+(ранее NEXUS30)
 
 B2B2C SaaS-платформа корпоративных льгот на основе seat-based subscription и promo codes.
 
@@ -126,6 +128,16 @@ docker compose logs backend | tail -20
 
 ## Архитектура
 
+Платформа построена на основе **слоистой архитектуры** (layered architecture) с чётким разделением ответственности:
+
+- **Presentation layer** — `routes.py` (FastAPI endpoints)
+- **Business logic layer** — `service.py` (domain logic, orchestration)
+- **Data access layer** — `models.py` (SQLAlchemy ORM)
+
+Все модули используют **dependency injection** через `Depends()` для управления зависимостями (DB session, auth user, config).
+
+**Подробнее:** [ARCHITECTURE.md](./ARCHITECTURE.md)
+
 ### Ключевые домены
 
 ```
@@ -139,7 +151,10 @@ app/
 ├── promo_codes/    — промокоды (crypto-secure generation)
 ├── redemptions/    — активация льгот сотрудниками
 ├── ai/             — Ollama integration (3 use cases)
+├── analytics/      — аналитика для компаний
 ├── events/         — SSE realtime events
+├── bot/            — Telegram bot API
+├── bitrix/         — Bitrix24 integration
 └── audit/          — audit logs
 ```
 
@@ -173,16 +188,23 @@ app/
 
 Три сценария через Ollama:
 
-### 1. Employee AI Concierge (§17)
+### 1. Employee AI Concierge
 
-Персонализированные рекомендации льгот:
+Персонализированные рекомендации льгот на основе:
+- План сотрудника (STANDARD/PLUS/PRO)
+- История активаций (приоритет новым категориям)
+- Поисковый запрос
+
 ```
 User: "Хочу спорт и минимум 20% скидки"
 → Backend фильтрует по company/plan/category/discount
-→ LLM ранжирует по релевантности
+→ Собирает историю использованных категорий
+→ LLM ранжирует по релевантности, приоритизируя новые категории
 ```
 
-**Эндпоинт:** `GET /api/v1/ai/recommendations`
+**Эндпоинт:** `GET /api/v1/ai/concierge`
+
+**Fallback:** если Ollama недоступна, возвращаются топ-5 льгот по скидке с приоритетом неиспользованных категорий.
 
 ### 2. Merchant AI Assistant (§18)
 
@@ -218,6 +240,98 @@ OLLAMA_IS_CLOUD=false
 ```
 
 Graceful fallback: при недоступности AI основная функциональность (auth, benefits, promo codes, redemptions) продолжает работать.
+
+## Telegram Bot
+
+Платформа включает Telegram-бота для проверки и активации промокодов сотрудниками.
+
+**Команды:**
+- `/start` — приветствие и список команд
+- `/check CODE` — проверить статус промокода
+- `/activate CODE` — погасить промокод
+
+**Настройка:**
+
+1. Создайте бота через [@BotFather](https://t.me/BotFather)
+2. Добавьте токен в `.env`:
+   ```env
+   TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+   BOT_API_KEY=<openssl rand -hex 32>
+   ```
+3. Перезапустите: `docker compose restart tg_bot`
+
+## Bitrix24 Integration
+
+Автоматический импорт сотрудников из Bitrix24 через REST API.
+
+**Настройка:**
+
+1. Получите входящий webhook:
+   - Зайдите в «Приложения» → «Webhook» → «Входящий webhook»
+   - Выберите права: `user` (чтение)
+   - Скопируйте URL вида `https://your-portal.bitrix24.ru/rest/1/xxxxx/`
+
+2. Импортируйте через UI (для COMPANY_ADMIN):
+   - Войдите как COMPANY_ADMIN
+   - Перейдите на вкладку «Сотрудники»
+   - Нажмите «Синхронизация с Bitrix24»
+   - Вставьте webhook URL и нажмите «Импортировать»
+
+3. Сотрудники будут созданы с временным паролем `changeme` — попросите их сменить при первом входе.
+
+**API:**
+```http
+POST /api/v1/companies/bitrix/sync
+{
+  "webhook_url": "https://your-portal.bitrix24.ru/rest/1/xxxxx/"
+}
+```
+
+## Production Deployment
+
+Для production используйте отдельный compose-файл:
+
+```bash
+# 1. Скопировать .env.prod.example в .env.prod и заполнить переменные
+cp .env.prod.example .env.prod
+nano .env.prod  # Заполнить POSTGRES_PASSWORD, JWT_SECRET, BOT_API_KEY
+
+# 2. Запустить production-стек
+docker compose -f docker-compose.prod.yml up -d
+
+# 3. Проверить healthcheck
+docker compose -f docker-compose.prod.yml ps
+curl https://yourdomain.com/api/v1/health
+```
+
+**Отличия production от development:**
+- `INSTALL_DEV=false` — без ruff/mypy/pytest
+- `APP_ENV=production`, `DEBUG=false`
+- Nginx с SSL, rate limiting, security headers
+- Порты backend/frontend не пробрасываются наружу (только через nginx)
+- Seed-сервис не запускается (нет демо-данных)
+
+### SSL-сертификаты
+
+**Вариант 1: Let's Encrypt (рекомендуется)**
+
+```bash
+sudo certbot certonly --standalone -d yourdomain.com
+sudo cp /etc/letsencrypt/live/yourdomain.com/fullchain.pem nginx/ssl/
+sudo cp /etc/letsencrypt/live/yourdomain.com/privkey.pem nginx/ssl/
+sudo chown $USER:$USER nginx/ssl/*.pem
+```
+
+**Вариант 2: Self-signed (только для тестирования)**
+
+```bash
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout nginx/ssl/privkey.pem \
+  -out nginx/ssl/fullchain.pem \
+  -subj "/C=UZ/ST=Tashkent/L=Tashkent/O=DevOrg/CN=localhost"
+```
+
+**Важно:** не коммитьте приватные ключи в git!
 
 ## API
 

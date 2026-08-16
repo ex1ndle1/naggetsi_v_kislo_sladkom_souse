@@ -129,3 +129,78 @@ async def delete_company(
 
     await db.delete(company)
     await db.commit()
+
+
+@router.post("/bitrix/sync")
+async def sync_bitrix_employees(
+    payload: "BitrixSyncRequest",
+    db: DbSession,
+    user: Annotated[CurrentUser, Depends(require_roles(UserRole.COMPANY_ADMIN))],
+) -> "BitrixSyncResponse":
+    """Импортировать сотрудников из Bitrix24 для компании текущего админа."""
+    from app.bitrix.schemas import BitrixSyncRequest, BitrixSyncResponse
+    from app.bitrix.service import BitrixService
+    from app.core.errors import BadRequest
+    from app.core.security import hash_password
+    from app.users.models import User
+
+    if not user.company_id:
+        raise BadRequest(message="User is not associated with a company")
+
+    company = await db.get(Company, user.company_id)
+    if company is None:
+        raise NotFound(message="Company not found")
+
+    # Обновить webhook URL
+    company.bitrix_webhook_url = str(payload.webhook_url)
+    company.bitrix_sync_enabled = True
+
+    # Скачать сотрудников
+    try:
+        employees_data = await BitrixService.fetch_employees(str(payload.webhook_url))
+    except ValueError as exc:
+        raise BadRequest(message=str(exc))
+
+    # Импортировать или обновить пользователей
+    created_count = 0
+    updated_count = 0
+
+    for emp in employees_data:
+        if not emp.get("email"):
+            continue  # Пропускаем без email
+
+        # Найти существующего по email или external_bitrix_id
+        stmt = select(User).where(
+            (User.email == emp["email"]) | (User.external_bitrix_id == emp["external_bitrix_id"])
+        )
+        existing = await db.scalar(stmt)
+
+        if existing:
+            # Обновить
+            existing.external_bitrix_id = emp["external_bitrix_id"]
+            existing.first_name = emp.get("first_name") or existing.first_name
+            existing.last_name = emp.get("last_name") or existing.last_name
+            updated_count += 1
+        else:
+            # Создать нового (без плана — назначит COMPANY_ADMIN позже)
+            new_user = User(
+                email=emp["email"],
+                password_hash=hash_password("changeme"),  # Временный пароль
+                first_name=emp.get("first_name", ""),
+                last_name=emp.get("last_name", ""),
+                role=UserRole.EMPLOYEE,
+                company_id=user.company_id,
+                external_bitrix_id=emp["external_bitrix_id"],
+            )
+            db.add(new_user)
+            created_count += 1
+
+    await db.commit()
+
+    return BitrixSyncResponse(
+        company_id=user.company_id,
+        webhook_url=str(payload.webhook_url),
+        total_fetched=len(employees_data),
+        created=created_count,
+        updated=updated_count,
+    )

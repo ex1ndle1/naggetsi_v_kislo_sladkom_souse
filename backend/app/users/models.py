@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from uuid import UUID
 
-from sqlalchemy import Boolean, ForeignKey, String
+from sqlalchemy import Boolean, ForeignKey, Integer, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -46,6 +46,9 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("merchants.id", ondelete="CASCADE"), nullable=True, index=True
     )
     merchant: Mapped[Merchant | None] = relationship(back_populates="users")
+
+    # Bitrix24 integration: external user ID from Bitrix24
+    external_bitrix_id: Mapped[int | None] = mapped_column(Integer, nullable=True, unique=True, index=True)
 
     @property
     def full_name(self) -> str:

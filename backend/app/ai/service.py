@@ -87,11 +87,14 @@ class OfferDraftResult(BaseModel):
 
 
 _CONCIERGE_SYSTEM = (
-    "You are a corporate benefits concierge. "
-    "You receive a catalog of benefits the employee is ELIGIBLE for and a query. "
-    "Rank the most relevant ones. "
-    'Respond with JSON only: {"benefit_ids": ["<id>", ...], "reasoning": "<one sentence>"}. '
-    "Use only ids present in the catalog. Never invent ids."
+    "You are a corporate benefits concierge assistant. "
+    "You receive: employee context (plan, previously used categories), their query, and a catalog of benefits they are ELIGIBLE for. "
+    "Your task: rank the benefits by relevance to the query. "
+    "Prioritize benefits in categories the employee has NOT used yet, unless their query explicitly asks for something they've used before. "
+    "If the query is vague or general, return 3-5 diverse options from different categories. "
+    'Respond with JSON only: {"benefit_ids": ["<uuid>", ...], "reasoning": "<one sentence explaining why these are relevant>"}. '
+    "Use only IDs present in the catalog. Never invent IDs. "
+    "Do not repeat the same category multiple times unless the query specifically asks for it."
 )
 
 _MERCHANT_SYSTEM = (
@@ -162,7 +165,15 @@ async def rank_benefits_for_employee(
 
     if not ranked:
         logger.info("concierge_fallback", reason="no_valid_ids")
-        return ConciergeResult(benefit_ids=sql_order, ai_used=False)
+        # Умный fallback: топ-5 по скидке, приоритет новым категориям
+        used_cats = set(employee_context.get("previously_used_categories", []))
+        fresh = [b for b in eligible if b["category"] not in used_cats]
+        if not fresh:
+            fresh = eligible
+        sorted_by_discount = sorted(fresh, key=lambda x: x.get("discount_percent", 0), reverse=True)
+        ranked = [UUID(str(b["id"])) for b in sorted_by_discount[:5]]
+        reasoning = "Showing top 5 offers with highest discounts (AI unavailable)."
+        return ConciergeResult(benefit_ids=ranked, reasoning=reasoning, ai_used=False)
 
     reasoning = parsed.get("reasoning")
     return ConciergeResult(

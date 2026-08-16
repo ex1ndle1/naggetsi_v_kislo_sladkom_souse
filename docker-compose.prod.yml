@@ -1,0 +1,176 @@
+version: "3.9"
+
+x-db-env: &db_env
+  POSTGRES_DB: ${POSTGRES_DB:?required}
+  POSTGRES_USER: ${POSTGRES_USER:?required}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: 5432
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: benefits_postgres_prod
+    environment:
+      <<: *db_env
+    volumes:
+      - postgres_data_prod:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - benefits_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: benefits_redis_prod
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - benefits_network
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        INSTALL_DEV: false
+    container_name: benefits_migrate_prod
+    command: migrate
+    environment:
+      <<: *db_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - benefits_network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        INSTALL_DEV: false
+    container_name: benefits_backend_prod
+    command: serve
+    environment:
+      <<: *db_env
+      PROJECT_NAME: ${PROJECT_NAME:-Наггетсы30}
+      APP_ENV: production
+      DEBUG: false
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:?required}
+      JWT_ALGORITHM: HS256
+      JWT_ACCESS_EXPIRE_MINUTES: ${JWT_ACCESS_EXPIRE_MINUTES:-15}
+      JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-7}
+      CORS_ORIGINS: ${CORS_ORIGINS:?required}
+      OLLAMA_HOST: ${OLLAMA_HOST:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
+      AI_ENABLED: ${AI_ENABLED:-true}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-30}
+      RATE_LIMIT_ENABLED: true
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-100}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      RATE_LIMIT_LOGIN: ${RATE_LIMIT_LOGIN:-10}
+      RATE_LIMIT_REGISTER: ${RATE_LIMIT_REGISTER:-5}
+      RATE_LIMIT_AI: ${RATE_LIMIT_AI:-15}
+      RATE_LIMIT_BENEFITS: ${RATE_LIMIT_BENEFITS:-60}
+      RATE_LIMIT_REDEMPTIONS: ${RATE_LIMIT_REDEMPTIONS:-10}
+      PROMO_CODE_DEFAULT_VALID_DAYS: ${PROMO_CODE_DEFAULT_VALID_DAYS:-30}
+      INVITE_TOKEN_EXPIRE_DAYS: ${INVITE_TOKEN_EXPIRE_DAYS:-7}
+      SSE_TICKET_TTL_SECONDS: ${SSE_TICKET_TTL_SECONDS:-60}
+      BOT_API_KEY: ${BOT_API_KEY:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: always
+    networks:
+      - benefits_network
+    expose:
+      - "8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: benefits_frontend_prod
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    networks:
+      - benefits_network
+    expose:
+      - "80"
+
+  tg_bot:
+    build:
+      context: ./tg_bot
+      dockerfile: Dockerfile
+    container_name: benefits_tg_bot_prod
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      BACKEND_URL: http://backend:8000
+      BOT_API_KEY: ${BOT_API_KEY:-}
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: always
+    networks:
+      - benefits_network
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: benefits_nginx_prod
+    ports:
+      - "${NGINX_PORT:-80}:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: always
+    networks:
+      - benefits_network
+
+volumes:
+  postgres_data_prod:
+  nginx_cache:
+
+networks:
+  benefits_network:
+    driver: bridge
