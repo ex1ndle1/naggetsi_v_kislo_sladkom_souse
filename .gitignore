@@ -29,6 +29,8 @@ htmlcov/
 # Environment
 .env
 .env.local
+.env.prod
+.env.prod
 
 # Database
 *.db

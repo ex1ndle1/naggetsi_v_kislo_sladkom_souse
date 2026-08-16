@@ -71,10 +71,12 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    cors_origins = settings.cors_origin_list
+    allow_all_origins = cors_origins == ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=settings.cors_origin_list,
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=not allow_all_origins,
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=[_REQUEST_ID_HEADER, "Retry-After"],

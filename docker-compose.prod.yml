@@ -16,7 +16,7 @@ services:
     volumes:
       - postgres_data_prod:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -71,7 +71,7 @@ services:
       JWT_ALGORITHM: HS256
       JWT_ACCESS_EXPIRE_MINUTES: ${JWT_ACCESS_EXPIRE_MINUTES:-15}
       JWT_REFRESH_EXPIRE_DAYS: ${JWT_REFRESH_EXPIRE_DAYS:-7}
-      CORS_ORIGINS: ${CORS_ORIGINS:?required}
+      CORS_ORIGINS: "*"
       OLLAMA_HOST: ${OLLAMA_HOST:-}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
       OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
@@ -143,17 +143,28 @@ services:
     networks:
       - benefits_network
 
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: benefits_cloudflared_prod
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?required}
+    depends_on:
+      nginx:
+        condition: service_healthy
+    restart: always
+    networks:
+      - benefits_network
+
   nginx:
     build:
       context: ./nginx
       dockerfile: Dockerfile
     container_name: benefits_nginx_prod
     ports:
-      - "${NGINX_PORT:-80}:80"
-      - "443:443"
+      - "${NGINX_PORT:-8080}:80"
     volumes:
       - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx/ssl:/etc/nginx/ssl:ro
       - nginx_cache:/var/cache/nginx
     depends_on:
       - frontend
